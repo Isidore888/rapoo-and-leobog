@@ -1,14 +1,20 @@
 #include "osd_window.h"
+#include "alert_window.h"
+#include "ui_theme.h"
 #include <strsafe.h>
 #include <algorithm>
 
 namespace Osd {
 
 static HWND g_hOsdWnd = NULL;
-static WCHAR g_textLine1[64] = {0};
-static WCHAR g_textLine2[64] = {0};
-static WCHAR g_textLine3[64] = {0};
+static WCHAR g_textLine1[128] = {0};
+static WCHAR g_textLine2[128] = {0};
+static WCHAR g_textLine3[128] = {0};
 static BYTE g_osdAlpha = 0;
+static bool statusMode=false, statusDark=true,valueMode=false,valueKeyboard=false;
+static wchar_t valueLabel[64]{},valueText[32]{};
+static Device::State statusMouse;
+static Keyboard::State statusKeyboard;
 
 static const COLORREF OSD_KEY_COLOR = RGB(10, 12, 16);
 static const UINT_PTR TIMER_OSD_HIDE = 101;
@@ -49,6 +55,18 @@ static LRESULT CALLBACK OsdWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
             UINT dpi = GetCurrentWindowDpi(hWnd);
             auto S = [dpi](int v) { return ScaleDpi(v, dpi); };
 
+            if(statusMode) {
+                DrawStatus(memDC,dpi,statusDark,statusMouse,statusKeyboard);
+                BitBlt(hdc,0,0,rc.right,rc.bottom,memDC,0,0,SRCCOPY);
+                SelectObject(memDC,oldBmp); DeleteObject(memBmp); DeleteDC(memDC);
+                EndPaint(hWnd,&ps); return 0;
+            }
+
+            if(valueMode) {
+                DrawValue(memDC,dpi,valueLabel,valueText,valueKeyboard);BitBlt(hdc,0,0,rc.right,rc.bottom,memDC,0,0,SRCCOPY);
+                SelectObject(memDC,oldBmp);DeleteObject(memBmp);DeleteDC(memDC);EndPaint(hWnd,&ps);return 0;
+            }
+
             // Fill with Key Color for transparency
             HBRUSH hKey = CreateSolidBrush(OSD_KEY_COLOR);
             FillRect(memDC, &rc, hKey);
@@ -58,8 +76,8 @@ static LRESULT CALLBACK OsdWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
             InflateRect(&rcBox, -S(2), -S(2));
 
             // Modern frosted card background & border
-            HBRUSH hBg = CreateSolidBrush(RGB(22, 25, 34));
-            HPEN hBorder = CreatePen(PS_SOLID, 1, RGB(70, 78, 96));
+            HBRUSH hBg = CreateSolidBrush(Ui::Background);
+            HPEN hBorder = CreatePen(PS_SOLID, 1, Ui::Border);
             HGDIOBJ oldBr = SelectObject(memDC, hBg);
             HGDIOBJ oldPen = SelectObject(memDC, hBorder);
 
@@ -67,6 +85,7 @@ static LRESULT CALLBACK OsdWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
 
             SetBkMode(memDC, TRANSPARENT);
 
+            bool hasLine2 = (g_textLine2[0] != 0);
             bool hasLine3 = (g_textLine3[0] != 0);
 
             // Font 1: Line 1 (Large bold title)
@@ -81,7 +100,7 @@ static LRESULT CALLBACK OsdWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
             RECT rcTop = rcBox;
             rcTop.top = rcBox.top + S(8);
             rcTop.bottom = rcTop.top + S(26);
-            DrawTextW(memDC, g_textLine1, -1, &rcTop, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DrawTextW(memDC, g_textLine1, -1, &rcTop, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
             // Font 2: Line 2 (Sub text)
             HFONT hFontMid = CreateFontW(
@@ -90,12 +109,12 @@ static LRESULT CALLBACK OsdWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
                 CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Microsoft YaHei UI"
             );
             SelectObject(memDC, hFontMid);
-            SetTextColor(memDC, RGB(210, 222, 238));
+            SetTextColor(memDC, Ui::Muted);
 
             RECT rcMid = rcBox;
             rcMid.top = rcTop.bottom + S(2);
             rcMid.bottom = rcMid.top + S(22);
-            DrawTextW(memDC, g_textLine2, -1, &rcMid, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DrawTextW(memDC, g_textLine2, -1, &rcMid, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
             // Font 3: Line 3 (Status bar / Cyan highlight)
             HFONT hFontSub = NULL;
@@ -109,9 +128,9 @@ static LRESULT CALLBACK OsdWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
                 SetTextColor(memDC, RGB(120, 210, 255));
 
                 RECT rcBot = rcBox;
-                rcBot.top = rcMid.bottom + S(2);
+                rcBot.top = (hasLine2 ? rcMid.bottom : rcTop.bottom) + S(2);
                 rcBot.bottom = rcBot.top + S(22);
-                DrawTextW(memDC, g_textLine3, -1, &rcBot, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                DrawTextW(memDC, g_textLine3, -1, &rcBot, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             }
 
             BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
@@ -187,8 +206,11 @@ HWND GetWindowHandle() {
     return g_hOsdWnd;
 }
 
-void Show(const WCHAR* line1, const WCHAR* line2, const WCHAR* line3) {
+void Show(const WCHAR* line1, const WCHAR* line2, const WCHAR* line3, UINT durationMs) {
     if (!g_hOsdWnd) return;
+    statusMode=false;valueMode=false;
+    SetWindowRgn(g_hOsdWnd,nullptr,TRUE);
+    SetWindowTextW(g_hOsdWnd,L"RapooOSD");
 
     StringCchCopyW(g_textLine1, ARRAYSIZE(g_textLine1), line1 ? line1 : L"");
     StringCchCopyW(g_textLine2, ARRAYSIZE(g_textLine2), line2 ? line2 : L"");
@@ -255,9 +277,9 @@ void Show(const WCHAR* line1, const WCHAR* line2, const WCHAR* line3) {
     // Add safe horizontal padding (18px each side)
     int targetW = maxTextW + S(36);
     targetW = std::max(targetW, S(210));
-    targetW = std::min(targetW, S(420));
+    targetW = std::min(targetW, std::min(S(640), int(rcWork.right-rcWork.left)-S(24)));
 
-    int targetH = hasLine3 ? S(88) : S(66);
+    int targetH = S(44 + (g_textLine2[0] ? 22 : 0) + (hasLine3 ? 22 : 0));
 
     int x = rcWork.left + ((rcWork.right - rcWork.left) - targetW) / 2;
     int y = rcWork.bottom - targetH - S(70);
@@ -271,27 +293,80 @@ void Show(const WCHAR* line1, const WCHAR* line2, const WCHAR* line3) {
     SetWindowPos(g_hOsdWnd, HWND_TOPMOST, x, y, targetW, targetH, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     InvalidateRect(g_hOsdWnd, NULL, TRUE);
 
-    SetTimer(g_hOsdWnd, TIMER_OSD_HIDE, 1600, NULL);
+    SetTimer(g_hOsdWnd, TIMER_OSD_HIDE, durationMs, NULL);
 }
 
-void ShowDpiUpdate(int level, int dpix, int dpiy, int battery, int pollingHz, bool isCharging, bool isWired, const WCHAR* modelName) {
-    WCHAR l1[64], l2[64], l3[64];
-    const WCHAR* mName = (modelName && modelName[0]) ? modelName : L"通用";
-    StringCchPrintfW(l1, ARRAYSIZE(l1), L"%s  DPI %d", mName, dpix);
-    StringCchPrintfW(l2, ARRAYSIZE(l2), L"X 轴: %d    Y 轴: %d", dpix, dpiy);
-
-    const WCHAR* modeStr = isWired ? L"USB" : L"2.4G";
-    const WCHAR* batIcon = isCharging ? L"⚡" : L"🔋";
-    StringCchPrintfW(l3, ARRAYSIZE(l3), L"%s  |  第 %d 档  |  %s %d%%  |  %d Hz",
-        modeStr, level, batIcon, battery, pollingHz);
-
-    Show(l1, l2, l3);
+void DrawValue(HDC dc,int dpi,const wchar_t* label,const wchar_t* value,bool keyboard) {
+    auto S=[dpi](int n){return Ui::Scale(n,dpi);};RECT all{0,0,S(360),S(80)};Ui::Surface(dc,all,dpi);
+    Ui::DeviceIcon(dc,S(19),S(27),dpi,keyboard);
+    Ui::Label(dc,label,RECT{S(57),S(14),S(192),S(66)},17,dpi,Ui::Muted);
+    Ui::Label(dc,value,RECT{S(196),S(10),S(339),S(70)},30,dpi,Ui::Accent,DT_RIGHT,true);
 }
-
-void ShowStyleOsd(int style) {
-    const WCHAR* names[] = { L"样式一：经典电池", L"样式二：环形进度", L"样式三：大号数字" };
-    int idx = std::clamp(style, 0, 2);
-    Show(L"电池图标样式", names[idx], L"双击托盘图标可循环切换");
+void ShowValue(const wchar_t* label,const wchar_t* value,bool keyboard,UINT durationMs) {
+    wchar_t combined[128];StringCchPrintfW(combined,128,L"%s %s",label,value);Show(combined,nullptr,nullptr,durationMs);
+    if(!g_hOsdWnd)return;valueMode=true;valueKeyboard=keyboard;StringCchCopyW(valueLabel,64,label);StringCchCopyW(valueText,32,value);
+    RECT old{};GetWindowRect(g_hOsdWnd,&old);int dpi=GetCurrentWindowDpi(g_hOsdWnd),w=Ui::Scale(360,dpi),h=Ui::Scale(80,dpi);
+    MONITORINFO mi{sizeof(mi)};GetMonitorInfoW(MonitorFromWindow(g_hOsdWnd,MONITOR_DEFAULTTONEAREST),&mi);
+    int x=std::clamp(int(old.left+(old.right-old.left-w)/2),int(mi.rcWork.left),std::max(int(mi.rcWork.left),int(mi.rcWork.right)-w));
+    SetWindowPos(g_hOsdWnd,nullptr,x,old.bottom-h,w,h,SWP_NOACTIVATE|SWP_NOZORDER);SetWindowRgn(g_hOsdWnd,CreateRoundRectRgn(0,0,w+1,h+1,Ui::Scale(22,dpi),Ui::Scale(22,dpi)),TRUE);InvalidateRect(g_hOsdWnd,nullptr,FALSE);
 }
+void ShowDpiUpdate(int level,int dpix,int dpiy,int battery,int pollingHz,bool isCharging,bool isWired,const WCHAR* modelName) {
+    (void)level;(void)dpiy;(void)battery;(void)pollingHz;(void)isCharging;(void)isWired;(void)modelName;
+    wchar_t value[32];StringCchPrintfW(value,32,L"%d",dpix);ShowValue(L"DPI",value,false);
+}
+void DrawStatus(HDC dc,int dpi,bool dark,const Device::State& mouse,const Keyboard::State& keyboard) {
+    (void)dark;auto S=[dpi](int n){return Ui::Scale(n,dpi);};Ui::Surface(dc,RECT{0,0,S(360),S(298)},dpi);
+    for(int k=0;k<2;++k) {
+        bool connected=k?keyboard.isConnected:mouse.isConnected,valid=connected && (k?keyboard.batteryValid:mouse.batteryValid);
+        bool wired=k?keyboard.isWired:mouse.isWired,charging=valid && (k?keyboard.isCharging:mouse.isCharging);
+        int percent=k?keyboard.battery:mouse.battery;valid=valid && percent>=0 && percent<=100;
+        int cx=S(90+k*180),cy=S(79),radius=S(50);COLORREF color=charging?RGB(148,229,181):valid && percent<=Alert::GetConfig(k).warning?RGB(255,184,138):k?Ui::Keyboard:Ui::Accent;
+        HPEN p=CreatePen(PS_SOLID,S(5),Ui::Border);auto op=SelectObject(dc,p);auto ob=SelectObject(dc,GetStockObject(NULL_BRUSH));Ellipse(dc,cx-radius,cy-radius,cx+radius,cy+radius);
+        SelectObject(dc,op);DeleteObject(p);
+        if(valid && percent>0) {p=CreatePen(PS_SOLID,S(5),color);SelectObject(dc,p);POINT points[101];int count=std::max(1,percent);
+            for(int n=0;n<=count;++n){double angle=-1.5707963267948966+6.283185307179586*n/100;points[n]={cx+LONG(radius*std::cos(angle)),cy+LONG(radius*std::sin(angle))};}Polyline(dc,points,count+1);SelectObject(dc,op);DeleteObject(p);}
+        SelectObject(dc,ob);
+        wchar_t value[32];if(valid)StringCchPrintfW(value,32,L"%d%%",percent);else StringCchCopyW(value,32,L"—");
+        Ui::Label(dc,value,RECT{cx-S(48),cy-S(28),cx+S(48),cy+S(9)},25,dpi,valid?color:Ui::Muted,DT_CENTER,true);
+        Ui::Label(dc,k?L"键盘":L"鼠标",RECT{cx-S(45),cy+S(9),cx+S(45),cy+S(35)},13,dpi,Ui::Muted,DT_CENTER);
+        if(charging)Ui::ChargeIcon(dc,cx+S(27),cy+S(12),dpi);
+        Ui::Connection(dc,RECT{cx-S(34),S(147),cx+S(34),S(173)},dpi,connected,wired);
+        for(int row=0;row<3;++row) {
+            const wchar_t* label=k?(row==0?L"亮度":row==1?L"速度":L"休眠"):(row==0?L"DPI":row==1?L"回报率":L"休眠");StringCchCopyW(value,32,L"—");
+            if(k) {
+                if(row<2 && connected && keyboard.lightingValid && !keyboard.lightingStale)StringCchPrintfW(value,32,L"%d%%",(row?keyboard.lightSpeed:keyboard.brightness)*25);
+                if(row==2 && connected && keyboard.sleepValid && !keyboard.sleepStale)StringCchPrintfW(value,32,keyboard.sleepSeconds%60?L"%d 秒":L"%d 分钟",keyboard.sleepSeconds%60?keyboard.sleepSeconds:keyboard.sleepSeconds/60);
+            } else if(connected) {
+                if(row==0 && mouse.dpiX>0)StringCchPrintfW(value,32,L"%d",mouse.dpiX);
+                if(row==1 && mouse.pollingHz>0)StringCchPrintfW(value,32,L"%d Hz",mouse.pollingHz);
+                if(row==2 && mouse.sleepMinutes>0)StringCchPrintfW(value,32,L"%d 分钟",mouse.sleepMinutes);
+            }
+            int top=S(192+row*29);Ui::Label(dc,label,RECT{cx-S(66),top,cx-S(8),top+S(27)},12,dpi,Ui::Muted);
+            Ui::Label(dc,value,RECT{cx-S(3),top,cx+S(66),top+S(27)},13,dpi,Ui::Text,DT_RIGHT);
+        }
+    }
+}
+void ShowStatus(const Device::State& mouse,const Keyboard::State& keyboard,POINT anchor,UINT durationMs) {
+    if(!g_hOsdWnd)return;
+    statusMode=true;valueMode=false;statusMouse=mouse;statusKeyboard=keyboard;
+    statusDark=true;
+    MONITORINFO mi{sizeof(mi)};GetMonitorInfoW(MonitorFromPoint(anchor,MONITOR_DEFAULTTONEAREST),&mi);
+    // Move first so per-monitor DPI is read from the target monitor.
+    SetWindowPos(g_hOsdWnd,nullptr,anchor.x,anchor.y,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
+    int dpi=GetCurrentWindowDpi(g_hOsdWnd),w=MulDiv(360,dpi,96),h=MulDiv(298,dpi,96);
+    int x=std::clamp(int(anchor.x)-w/2,int(mi.rcWork.left),std::max(int(mi.rcWork.left),int(mi.rcWork.right)-w));
+    int y=std::clamp(int(anchor.y)-h-MulDiv(12,dpi,96),int(mi.rcWork.top),std::max(int(mi.rcWork.top),int(mi.rcWork.bottom)-h));
+    KillTimer(g_hOsdWnd,TIMER_OSD_HIDE);KillTimer(g_hOsdWnd,TIMER_OSD_FADE);
+    g_osdAlpha=255;SetLayeredWindowAttributes(g_hOsdWnd,0,255,LWA_ALPHA);
+    SetWindowPos(g_hOsdWnd,HWND_TOPMOST,x,y,w,h,SWP_SHOWWINDOW|SWP_NOACTIVATE);
+    HRGN region=CreateRoundRectRgn(0,0,w+1,h+1,MulDiv(14,dpi,96),MulDiv(14,dpi,96));SetWindowRgn(g_hOsdWnd,region,TRUE);
+    SetWindowTextW(g_hOsdWnd,L"鼠标和键盘电量");InvalidateRect(g_hOsdWnd,nullptr,TRUE);
+    if(durationMs)SetTimer(g_hOsdWnd,TIMER_OSD_HIDE,durationMs,nullptr);
+}
+void UpdateStatus(const Device::State& mouse,const Keyboard::State& keyboard) {
+    if(!IsStatusVisible())return;statusMouse=mouse;statusKeyboard=keyboard;InvalidateRect(g_hOsdWnd,nullptr,FALSE);
+}
+bool IsStatusVisible(){return statusMode && g_hOsdWnd && IsWindowVisible(g_hOsdWnd);}
+void HideStatus(){if(!statusMode)return;KillTimer(g_hOsdWnd,TIMER_OSD_HIDE);KillTimer(g_hOsdWnd,TIMER_OSD_FADE);ShowWindow(g_hOsdWnd,SW_HIDE);}
 
 } // namespace Osd

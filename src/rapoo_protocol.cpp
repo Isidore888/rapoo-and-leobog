@@ -4,11 +4,11 @@
 
 namespace Rapoo {
 
-DWORD BuildUnlockPacket(BYTE* outBuf, DWORD bufSize) {
+DWORD BuildUnlockPacket(BYTE* outBuf, DWORD bufSize, bool wired) {
     if (!outBuf || bufSize < 33) return 0;
     std::memset(outBuf, 0, bufSize);
     outBuf[0] = REPORT_ID_CONTROL; // 0x06
-    outBuf[1] = 0xA5;
+    outBuf[1] = wired ? 0xFF : 0xA5;
     outBuf[2] = 0xA3;
     outBuf[3] = 0x00;
     outBuf[4] = 0x00;
@@ -19,11 +19,11 @@ DWORD BuildUnlockPacket(BYTE* outBuf, DWORD bufSize) {
     return 33;
 }
 
-DWORD BuildWriteCommand(BYTE bank, BYTE addr, const BYTE* pData, BYTE dataLen, BYTE* outBuf, DWORD bufSize) {
+DWORD BuildWriteCommand(BYTE bank, BYTE addr, const BYTE* pData, BYTE dataLen, BYTE* outBuf, DWORD bufSize, bool wired) {
     if (!outBuf || bufSize < 33) return 0;
     std::memset(outBuf, 0, bufSize);
     outBuf[0] = REPORT_ID_CONTROL; // 0x06
-    outBuf[1] = 0xA5;
+    outBuf[1] = wired ? 0xFF : 0xA5;
     outBuf[2] = 0xA5;
     outBuf[3] = (BYTE)(dataLen & 0xFF);
     outBuf[4] = addr;
@@ -37,11 +37,11 @@ DWORD BuildWriteCommand(BYTE bank, BYTE addr, const BYTE* pData, BYTE dataLen, B
     return 33;
 }
 
-DWORD BuildReadCommand(BYTE bank, BYTE addr, BYTE readLen, BYTE* outBuf, DWORD bufSize) {
+DWORD BuildReadCommand(BYTE bank, BYTE addr, BYTE readLen, BYTE* outBuf, DWORD bufSize, bool wired) {
     if (!outBuf || bufSize < 33) return 0;
     std::memset(outBuf, 0, bufSize);
     outBuf[0] = REPORT_ID_CONTROL; // 0x06
-    outBuf[1] = 0xA5;
+    outBuf[1] = wired ? 0xFF : 0xA5;
     outBuf[2] = 0xA4;
     outBuf[3] = readLen;
     outBuf[4] = addr;
@@ -53,13 +53,18 @@ DWORD BuildReadCommand(BYTE bank, BYTE addr, BYTE readLen, BYTE* outBuf, DWORD b
 }
 
 bool ParseStatusReport(const BYTE* buf, DWORD bytesRead, DeviceStatus& outStatus, int cachedBattery) {
-    if (!buf || bytesRead < 9) return false;
+    if (!buf || bytesRead != 19) return false;
     if (buf[0] != REPORT_ID_STATUS) return false;
     // Device marker: 0x20 (2.4G dongle), 0x10 (wired USB direct).
     // High nibble contains device mode; lower nibble carries dynamic status bits.
     BYTE modeNibble = buf[1] & 0xF0;
-    if (modeNibble != 0x20 && modeNibble != 0x10) return false;
+    // Master V2 reports 0x40/0x42 on the confirmed 146E/466E endpoints.
+    if (modeNibble != 0x20 && modeNibble != 0x10 && modeNibble != 0x40) return false;
     outStatus.isWired = (modeNibble == 0x10);
+    // A Hub's report parser omits the report ID: rpt[10]/cfgSel[11]
+    // therefore become bytes 11/12 in the Windows report. Confirmed V2 only.
+    outStatus.pollingHz = modeNibble == 0x40 ? CodeToPollingHz(buf[11]) : 0;
+    outStatus.profileSlot = modeNibble == 0x40 && buf[12] <= 7 ? buf[12] : -1;
 
     outStatus.dpiLevel = (int)buf[2] + 1;
     outStatus.dpiX = (int)buf[3] | ((int)buf[4] << 8);
@@ -72,24 +77,12 @@ bool ParseStatusReport(const BYTE* buf, DWORD bytesRead, DeviceStatus& outStatus
     // Charging flag detection based on Rapoo status flags
     bool charging = ((statusByte & 0x02) != 0 || statusByte == 0x02 || statusByte == 0x03 ||
                      extraByte == 0x01 || extraByte == 0x02);
-    outStatus.isCharging = charging;
+    outStatus.isCharging = modeNibble == 0x40 ? (buf[1] & 0x02) != 0 : charging;
 
-    // Battery percentage filtering:
-    // In Rapoo hardware, rawBat is an integer 0..100.
-    // When the mouse is first plugged into USB/charging, rawBat may momentarily report 0 or 1
-    // (transient handshake / ADC settle time). We protect the battery gauge by retaining
-    // the previous valid reading until a real measurement (>= 2) arrives.
-    if (rawBat >= 2 && rawBat <= 100) {
-        outStatus.battery = rawBat;
-    } else if (rawBat <= 1) {
-        if (cachedBattery >= 2 && cachedBattery <= 100) {
-            outStatus.battery = cachedBattery;
-        } else {
-            outStatus.battery = (rawBat == 0) ? 100 : rawBat;
-        }
-    } else {
-        outStatus.battery = 100;
-    }
+    // A valid zero is empty; never substitute unknown data with a full battery.
+    if (rawBat > 100) return false;
+    outStatus.battery = rawBat;
+    (void)cachedBattery;
 
     return true;
 }
@@ -125,7 +118,7 @@ int CodeToPollingHz(BYTE code) {
         case 0x84: return 2000;
         case 0x82: return 4000;
         case 0x81: return 8000;
-        default:   return 1000;
+        default:   return 0;
     }
 }
 

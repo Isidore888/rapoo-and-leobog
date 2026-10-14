@@ -1,5 +1,9 @@
 #include "tray_menu.h"
 #include "osd_window.h"
+#include "alert_window.h"
+#include "autostart.h"
+#include "ui_theme.h"
+#include <windowsx.h>
 #include <dwmapi.h>
 #include <strsafe.h>
 #include <cstring>
@@ -9,8 +13,7 @@
 
 namespace Tray {
 
-static const WCHAR* RUN_KEY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-static const WCHAR* APP_NAME = L"rapoo-tray";
+static Autostart::State g_autoState;
 
 static HWND g_hParentAppWnd = NULL;
 static HWND g_hAcrylicMenu = NULL;
@@ -20,18 +23,32 @@ static bool g_bModalLoop = false;
 
 static int g_curDpi = 96;
 static bool g_curDark = false;
-static int g_activeSubId = 0; // 0: None, 1: Polling Hz, 2: Sleep Slider
+static int g_activeSubId = 0; // 1: mouse rate, 2/5: mouse/keyboard sleep, 3/4: brightness/speed
 static int g_mainHover = -1;
 static int g_subHover = -1;
+// Main values and submenu checks always use the same published snapshot.
+static Device::State g_menuMouse;
+static Keyboard::State g_menuKeyboard;
 
 // Sleep slider state
 static bool g_isDraggingSlider = false;
 static int g_sliderVal = 10;
-static const int PRESET_SLEEP[] = { 5, 10, 15, 30, 60 };
-
+static constexpr UINT_PTR WheelCommitTimer=41;
+static const int PRESET_SLEEP[] = { 5, 10, 30 };
 static inline int S(int val) {
     return MulDiv(val, g_curDpi, 96);
 }
+
+static bool IsSleepSlider(int type) {return type==2 || type==5;}
+static int SliderMinimum() {return g_activeSubId==5?1:2;}
+static int ClampSlider(int value) {return std::clamp(value,SliderMinimum(),120);}
+static int SliderFromRatio(double ratio) {return ClampSlider(SliderMinimum()+int(std::clamp(ratio,0.0,1.0)*(120-SliderMinimum())+0.5));}
+static int SettingListHit(int type,int y) {
+    int count=type==1?7:(type==3 || type==4)?5:0;
+    int index=(y-S(8))/S(28);
+    return y>=S(8) && index<count?index:-1;
+}
+
 
 // Windows 11 / 10 Acrylic & Theme Hooks
 typedef enum _ACCENT_STATE {
@@ -145,8 +162,8 @@ int GetBatteryStyle() {
         HKEY hKey;
         DWORD val = 0, size = sizeof(DWORD), type = 0;
         if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\rapoo-tray", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-            if (RegQueryValueExW(hKey, L"BatteryStyle", NULL, &type, (LPBYTE)&val, &size) == ERROR_SUCCESS) {
-                g_batteryStyle = (int)val % 3;
+            if (RegQueryValueExW(hKey, L"DualBatteryStyleV2", NULL, &type, (LPBYTE)&val, &size) == ERROR_SUCCESS) {
+                g_batteryStyle = val <= 2 ? (int)val : 0;
             }
             RegCloseKey(hKey);
         }
@@ -160,35 +177,24 @@ int CycleBatteryStyle() {
     HKEY hKey;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\rapoo-tray", 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
         DWORD val = (DWORD)g_batteryStyle;
-        RegSetValueExW(hKey, L"BatteryStyle", 0, REG_DWORD, (const BYTE*)&val, sizeof(DWORD));
+        RegSetValueExW(hKey, L"DualBatteryStyleV2", 0, REG_DWORD, (const BYTE*)&val, sizeof(DWORD));
         RegCloseKey(hKey);
     }
     return g_batteryStyle;
 }
 
 bool IsAutoRunEnabled() {
-    HKEY hKey;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        WCHAR path[MAX_PATH];
-        DWORD len = sizeof(path), type = 0;
-        LSTATUS st = RegQueryValueExW(hKey, APP_NAME, NULL, &type, (LPBYTE)path, &len);
-        RegCloseKey(hKey);
-        return (st == ERROR_SUCCESS);
-    }
-    return false;
+    g_autoState=Autostart::Read();
+    return g_autoState.status==Autostart::Status::Registered;
 }
 
 void ToggleAutoRun() {
-    HKEY hKey;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_READ | KEY_WRITE, &hKey) == ERROR_SUCCESS) {
-        if (IsAutoRunEnabled()) {
-            RegDeleteValueW(hKey, APP_NAME);
-        } else {
-            WCHAR path[MAX_PATH];
-            GetModuleFileNameW(NULL, path, MAX_PATH);
-            RegSetValueExW(hKey, APP_NAME, 0, REG_SZ, (const BYTE*)path, (DWORD)((wcslen(path) + 1) * sizeof(WCHAR)));
-        }
-        RegCloseKey(hKey);
+    auto before=Autostart::Read();
+    bool enable=before.status!=Autostart::Status::Registered;
+    g_autoState=Autostart::Set(enable);
+    if(g_autoState.error) {
+        wchar_t detail[96];StringCchPrintfW(detail,96,L"启动项操作或回读失败（错误 %lu）",g_autoState.error);
+        Osd::Show(L"自启动设置未完成",detail);
     }
 }
 
@@ -244,6 +250,183 @@ static LRESULT CALLBACK MenuMouseHookProc(int nCode, WPARAM wParam, LPARAM lPara
     return CallNextHookEx(g_hMenuMouseHook, nCode, wParam, lParam);
 }
 
+static void QueueKeyboardSetting(KeyboardProtocol::Setting setting,int value) {
+    HWND owner=g_hParentAppWnd;
+    DismissAllMenus();
+    PostMessageW(owner,KeyboardSettingMessage,static_cast<WPARAM>(setting),value);
+}
+
+static void ApplySleepSlider() {
+    if(g_activeSubId==5) {
+        QueueKeyboardSetting(KeyboardProtocol::Setting::Sleep,g_sliderVal*60);
+        return;
+    }
+    HWND owner=g_hParentAppWnd;int value=g_sliderVal;
+    DismissAllMenus();PostMessageW(owner,MouseSettingMessage,1,value);
+}
+
+static void DrawSubMenuSurface(HDC memDC,const RECT& rc) {
+    COLORREF bgCol = Ui::Background;
+    COLORREF borderCol = Ui::Border;
+    COLORREF hoverCol = Ui::Control;
+    COLORREF textCol = Ui::Text;
+    COLORREF checkCol = Ui::Accent;
+    COLORREF trackBgCol = g_curDark ? RGB(45, 50, 60) : RGB(215, 220, 230);
+
+    HBRUSH bgBrush = CreateSolidBrush(bgCol);
+    Ui::Surface(memDC,rc,g_curDpi);
+    DeleteObject(bgBrush);
+
+    HPEN borderPen = CreatePen(PS_SOLID, 1, borderCol);
+    HGDIOBJ oldPen = SelectObject(memDC, borderPen);
+    HGDIOBJ oldBrush = SelectObject(memDC, GetStockObject(NULL_BRUSH));
+    RoundRect(memDC, 0, 0, rc.right, rc.bottom, S(22), S(22));
+    SelectObject(memDC, oldPen);
+    DeleteObject(borderPen);
+
+    HFONT hFontNormal = CreateFontW(-S(13), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                    CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+    HFONT hFontBold = CreateFontW(-S(13), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                                  DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                  CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+    HFONT hFontSmall = CreateFontW(-S(11), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                   CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+
+    SetBkMode(memDC, TRANSPARENT);
+    HGDIOBJ oldFont = SelectObject(memDC, hFontNormal);
+
+    if (g_activeSubId == 1 || g_activeSubId==3 || g_activeSubId==4) { // Setting list
+        const WCHAR* labels[] = { L"125 Hz", L"250 Hz", L"500 Hz", L"1000 Hz", L"2000 Hz", L"4000 Hz", L"8000 Hz" };
+        const int hzVals[] = { 125, 250, 500, 1000, 2000, 4000, 8000 };
+        int currentHz = g_menuMouse.pollingHz;
+        const auto& keyboard=g_menuKeyboard;
+
+        int count = g_activeSubId==1 ? 7 : 5;
+        int itemH = S(28);
+        int y = S(8);
+        for (int i = 0; i < count; i++) {
+            RECT rItem = { S(6), y, rc.right - S(6), y + itemH };
+            if (i == g_subHover) {
+                HBRUSH hH = CreateSolidBrush(hoverCol);
+                HPEN hP = CreatePen(PS_SOLID, 1, hoverCol);
+                HGDIOBJ oP = SelectObject(memDC, hP);
+                HGDIOBJ oB = SelectObject(memDC, hH);
+                RoundRect(memDC, rItem.left, rItem.top + 1, rItem.right, rItem.bottom - 1, S(6), S(6));
+                SelectObject(memDC, oP);
+                SelectObject(memDC, oB);
+                DeleteObject(hP);
+                DeleteObject(hH);
+            }
+
+            SetTextColor(memDC, textCol);
+            RECT rText = { S(14), y, rc.right - S(32), y + itemH };
+            WCHAR option[24];
+            StringCchPrintfW(option,24,L"%d%%",i*25);
+            DrawTextW(memDC,g_activeSubId==1?labels[i]:option,-1,&rText,DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+            if (g_activeSubId==1 ? hzVals[i]==currentHz : keyboard.lightingValid && i==(g_activeSubId==3?keyboard.brightness:keyboard.lightSpeed)) {
+                SetTextColor(memDC, checkCol);
+                RECT rCheck = { rc.right - S(28), y, rc.right - S(10), y + itemH };
+                DrawTextW(memDC, L"✓", -1, &rCheck, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+            y += itemH;
+        }
+    } else if (IsSleepSlider(g_activeSubId)) { // Shared mouse/keyboard sleep slider
+        // Header Row: Label + Value
+        SelectObject(memDC, hFontNormal);
+        SetTextColor(memDC, textCol);
+        RECT rHeader = { S(16), S(14), rc.right - S(122), S(38) };
+        DrawTextW(memDC, g_activeSubId==5?L"键盘休眠":L"鼠标休眠", -1, &rHeader, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+        SelectObject(memDC, hFontBold);
+        SetTextColor(memDC, checkCol);
+        WCHAR szVal[32];
+        StringCchPrintfW(szVal, ARRAYSIZE(szVal), L"%d 分钟", g_sliderVal);
+        RECT rVal = { rc.right - S(116), S(14), rc.right - S(16), S(38) };
+        DrawTextW(memDC, szVal, -1, &rVal, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+
+        // Slider Track
+        int trackX0 = S(20);
+        int trackX1 = rc.right - S(20);
+        int trackY = S(58);
+        int trackH = S(4);
+
+        double ratio = (double)(g_sliderVal - SliderMinimum()) / (double)(120 - SliderMinimum());
+        ratio = std::clamp(ratio, 0.0, 1.0);
+        int thumbX = trackX0 + (int)(ratio * (trackX1 - trackX0));
+
+        // Draw background track (inactive portion)
+        HBRUSH hTrackBg = CreateSolidBrush(trackBgCol);
+        HGDIOBJ oP = SelectObject(memDC, GetStockObject(NULL_PEN));
+        HGDIOBJ oB = SelectObject(memDC, hTrackBg);
+        RoundRect(memDC, thumbX, trackY - trackH / 2, trackX1, trackY + trackH / 2 + 1, S(4), S(4));
+
+        // Draw filled track (active portion)
+        HBRUSH hTrackActive = CreateSolidBrush(checkCol);
+        SelectObject(memDC, hTrackActive);
+        RoundRect(memDC, trackX0, trackY - trackH / 2, thumbX, trackY + trackH / 2 + 1, S(4), S(4));
+
+        // Draw thumb
+        int thumbR = S(8);
+        HBRUSH hThumbBg = CreateSolidBrush(g_curDark ? RGB(255, 255, 255) : RGB(255, 255, 255));
+        HPEN hThumbBorder = CreatePen(PS_SOLID, 2, checkCol);
+        SelectObject(memDC, hThumbBorder);
+        SelectObject(memDC, hThumbBg);
+        Ellipse(memDC, thumbX - thumbR, trackY - thumbR, thumbX + thumbR, trackY + thumbR);
+
+        SelectObject(memDC,oP);
+        SelectObject(memDC,oB);
+        DeleteObject(hThumbBg);
+        DeleteObject(hThumbBorder);
+        DeleteObject(hTrackActive);
+        DeleteObject(hTrackBg);
+
+        Ui::Label(memDC,g_activeSubId==5?L"1 分钟":L"2 分钟",RECT{S(20),S(70),S(94),S(91)},11,g_curDpi,Ui::Muted);
+        Ui::Label(memDC,L"120 分钟",RECT{rc.right-S(105),S(70),rc.right-S(20),S(91)},11,g_curDpi,Ui::Muted,DT_RIGHT);
+
+        // Preset Chips Row
+        SelectObject(memDC, hFontSmall);
+        int count = int(std::size(PRESET_SLEEP));
+        int chipW = (rc.right - S(40) - (count - 1) * S(6)) / count;
+        int curX = S(20);
+        int chipY0 = S(96);
+        int chipY1 = chipY0 + S(26);
+
+        for (int i = 0; i < count; i++) {
+            RECT rChip = { curX, chipY0, curX + chipW, chipY1 };
+            bool isCur = (g_sliderVal == PRESET_SLEEP[i]);
+
+            HBRUSH hChipBg = CreateSolidBrush(isCur ? checkCol : (g_curDark ? RGB(36, 40, 50) : RGB(232, 236, 244)));
+            HPEN hChipPen = CreatePen(PS_SOLID, 1, isCur ? checkCol : borderCol);
+            SelectObject(memDC, hChipPen);
+            SelectObject(memDC, hChipBg);
+            RoundRect(memDC, rChip.left, rChip.top, rChip.right, rChip.bottom, S(6), S(6));
+            SelectObject(memDC,oP);
+            SelectObject(memDC,oB);
+            DeleteObject(hChipPen);
+            DeleteObject(hChipBg);
+
+            SetTextColor(memDC, isCur ? (g_curDark ? RGB(10, 12, 16) : RGB(255, 255, 255)) : textCol);
+            WCHAR szChip[16];
+            StringCchPrintfW(szChip, ARRAYSIZE(szChip), L"%d分", PRESET_SLEEP[i]);
+            DrawTextW(memDC, szChip, -1, &rChip, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+            curX += chipW + S(6);
+        }
+    }
+
+    SelectObject(memDC, oldFont);
+    SelectObject(memDC, oldPen);
+    SelectObject(memDC, oldBrush);
+    DeleteObject(hFontNormal);
+    DeleteObject(hFontBold);
+    DeleteObject(hFontSmall);
+
+}
+
+
 // Submenu Window Procedure
 static LRESULT CALLBACK AcrylicSubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -261,24 +444,14 @@ static LRESULT CALLBACK AcrylicSubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             return 1;
 
         case WM_MOUSEWHEEL: {
-            if (g_activeSubId == 2) { // Sleep Slider
+            if (IsSleepSlider(g_activeSubId)) { // Sleep Slider
                 short delta = GET_WHEEL_DELTA_WPARAM(wParam);
                 int step = (delta > 0) ? 1 : -1;
                 if (GetKeyState(VK_SHIFT) & 0x8000) step *= 5;
-                g_sliderVal = std::clamp(g_sliderVal + step, 2, 120);
-                Device::SetSleepTimeout(g_sliderVal);
+                g_sliderVal = ClampSlider(g_sliderVal + step);
+                SetTimer(hWnd,WheelCommitTimer,250,nullptr);
 
-                Device::State st = Device::GetCurrentState();
-                WCHAR l1[64], l2[64], l3[64];
-                StringCchPrintfW(l1, ARRAYSIZE(l1), L"休眠时间: %d 分钟", g_sliderVal);
-                StringCchPrintfW(l2, ARRAYSIZE(l2), L"设置已即时生效并已保存");
-                const WCHAR* modeStr = st.isWired ? L"USB" : L"2.4G";
-                const WCHAR* batIcon = st.isCharging ? L"⚡" : L"🔋";
-                StringCchPrintfW(l3, ARRAYSIZE(l3), L"%s  |  第 %d 档  |  %s %d%%  |  %d Hz",
-                    modeStr, st.dpiLevel, batIcon, st.battery, st.pollingHz);
-                Osd::Show(l1, l2, l3);
-
-                InvalidateRect(hWnd, NULL, FALSE);
+                if(IsWindow(hWnd)) InvalidateRect(hWnd, NULL, FALSE);
                 if (g_hAcrylicMenu) InvalidateRect(g_hAcrylicMenu, NULL, FALSE);
                 return 0;
             }
@@ -286,12 +459,13 @@ static LRESULT CALLBACK AcrylicSubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
         }
 
         case WM_LBUTTONDOWN: {
+            KillTimer(hWnd,WheelCommitTimer);
             int mx = LOWORD(lParam);
             int my = HIWORD(lParam);
             RECT rc;
             GetClientRect(hWnd, &rc);
 
-            if (g_activeSubId == 2) {
+            if (IsSleepSlider(g_activeSubId)) {
                 // Sleep Slider Track interaction
                 int trackX0 = S(20);
                 int trackX1 = rc.right - S(20);
@@ -302,7 +476,7 @@ static LRESULT CALLBACK AcrylicSubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
                     SetCapture(hWnd);
                     double ratio = (double)(mx - trackX0) / (double)(trackX1 - trackX0);
                     ratio = std::clamp(ratio, 0.0, 1.0);
-                    g_sliderVal = Rapoo::ClampSleepMinutes(2 + (int)(ratio * (120 - 2) + 0.5));
+                    g_sliderVal = SliderFromRatio(ratio);
                     InvalidateRect(hWnd, NULL, FALSE);
                     return 0;
                 }
@@ -311,25 +485,15 @@ static LRESULT CALLBACK AcrylicSubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
                 int chipY0 = S(96);
                 int chipY1 = chipY0 + S(26);
                 if (my >= chipY0 && my <= chipY1) {
-                    int count = 5;
+                    int count = int(std::size(PRESET_SLEEP));
                     int chipW = (rc.right - S(40) - (count - 1) * S(6)) / count;
                     int curX = S(20);
                     for (int i = 0; i < count; i++) {
                         if (mx >= curX && mx <= curX + chipW) {
                             g_sliderVal = PRESET_SLEEP[i];
-                            Device::SetSleepTimeout(g_sliderVal);
+                            ApplySleepSlider();
 
-                            Device::State st = Device::GetCurrentState();
-                            WCHAR l1[64], l2[64], l3[64];
-                            StringCchPrintfW(l1, ARRAYSIZE(l1), L"休眠时间: %d 分钟", g_sliderVal);
-                            StringCchPrintfW(l2, ARRAYSIZE(l2), L"设置已即时生效并已保存");
-                            const WCHAR* modeStr = st.isWired ? L"USB" : L"2.4G";
-                            const WCHAR* batIcon = st.isCharging ? L"⚡" : L"🔋";
-                            StringCchPrintfW(l3, ARRAYSIZE(l3), L"%s  |  第 %d 档  |  %s %d%%  |  %d Hz",
-                                modeStr, st.dpiLevel, batIcon, st.battery, st.pollingHz);
-                            Osd::Show(l1, l2, l3);
-
-                            InvalidateRect(hWnd, NULL, FALSE);
+                            if(IsWindow(hWnd)) InvalidateRect(hWnd, NULL, FALSE);
                             if (g_hAcrylicMenu) InvalidateRect(g_hAcrylicMenu, NULL, FALSE);
                             return 0;
                         }
@@ -346,12 +510,12 @@ static LRESULT CALLBACK AcrylicSubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             RECT rc;
             GetClientRect(hWnd, &rc);
 
-            if (g_activeSubId == 2 && g_isDraggingSlider) {
+            if (IsSleepSlider(g_activeSubId) && g_isDraggingSlider) {
                 int trackX0 = S(20);
                 int trackX1 = rc.right - S(20);
                 double ratio = (double)(mx - trackX0) / (double)(trackX1 - trackX0);
                 ratio = std::clamp(ratio, 0.0, 1.0);
-                int newVal = Rapoo::ClampSleepMinutes(2 + (int)(ratio * (120 - 2) + 0.5));
+                int newVal = SliderFromRatio(ratio);
                 if (newVal != g_sliderVal) {
                     g_sliderVal = newVal;
                     InvalidateRect(hWnd, NULL, FALSE);
@@ -359,18 +523,8 @@ static LRESULT CALLBACK AcrylicSubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
                 return 0;
             }
 
-            if (g_activeSubId == 1) { // Polling Rate list
-                int count = 7;
-                int itemH = S(28);
-                int y = S(8);
-                int newH = -1;
-                for (int i = 0; i < count; i++) {
-                    if (my >= y && my < y + itemH) {
-                        newH = i;
-                        break;
-                    }
-                    y += itemH;
-                }
+            if (g_activeSubId == 1 || g_activeSubId==3 || g_activeSubId==4) { // Setting list
+                int newH = SettingListHit(g_activeSubId,my);
                 if (newH != g_subHover) {
                     g_subHover = newH;
                     InvalidateRect(hWnd, NULL, FALSE);
@@ -380,23 +534,22 @@ static LRESULT CALLBACK AcrylicSubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
         }
 
         case WM_LBUTTONUP: {
-            if (g_activeSubId == 2 && g_isDraggingSlider) {
+            if (IsSleepSlider(g_activeSubId) && g_isDraggingSlider) {
                 g_isDraggingSlider = false;
                 ReleaseCapture();
 
-                Device::SetSleepTimeout(g_sliderVal);
-
-                Device::State st = Device::GetCurrentState();
-                WCHAR l1[64], l2[64], l3[64];
-                StringCchPrintfW(l1, ARRAYSIZE(l1), L"休眠时间: %d 分钟", g_sliderVal);
-                StringCchPrintfW(l2, ARRAYSIZE(l2), L"设置已即时生效并已保存");
-                const WCHAR* modeStr = st.isWired ? L"USB" : L"2.4G";
-                const WCHAR* batIcon = st.isCharging ? L"⚡" : L"🔋";
-                StringCchPrintfW(l3, ARRAYSIZE(l3), L"%s  |  第 %d 档  |  %s %d%%  |  %d Hz",
-                    modeStr, st.dpiLevel, batIcon, st.battery, st.pollingHz);
-                Osd::Show(l1, l2, l3);
+                ApplySleepSlider();
 
                 if (g_hAcrylicMenu) InvalidateRect(g_hAcrylicMenu, NULL, FALSE);
+                return 0;
+            }
+
+            RECT rc{};GetClientRect(hWnd,&rc);
+            int x=GET_X_LPARAM(lParam),y=GET_Y_LPARAM(lParam);
+            g_subHover=x>=0 && x<rc.right?SettingListHit(g_activeSubId,y):-1;
+            if((g_activeSubId==3 || g_activeSubId==4) && g_subHover>=0) {
+                auto setting=g_activeSubId==3?KeyboardProtocol::Setting::Brightness:KeyboardProtocol::Setting::Speed;
+                QueueKeyboardSetting(setting,g_subHover);
                 return 0;
             }
 
@@ -405,17 +558,7 @@ static LRESULT CALLBACK AcrylicSubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
                 int hz = hzVals[g_subHover];
                 DismissAllMenus();
 
-                Device::SetPollingRate(hz);
-
-                Device::State st = Device::GetCurrentState();
-                WCHAR l1[64], l2[64], l3[64];
-                StringCchPrintfW(l1, ARRAYSIZE(l1), L"回报率: %d Hz", hz);
-                StringCchPrintfW(l2, ARRAYSIZE(l2), L"设置已即时生效");
-                const WCHAR* modeStr = st.isWired ? L"USB" : L"2.4G";
-                const WCHAR* batIcon = st.isCharging ? L"⚡" : L"🔋";
-                StringCchPrintfW(l3, ARRAYSIZE(l3), L"%s  |  第 %d 档  |  %s %d%%  |  %d Hz",
-                    modeStr, st.dpiLevel, batIcon, st.battery, hz);
-                Osd::Show(l1, l2, l3);
+                PostMessageW(g_hParentAppWnd,MouseSettingMessage,0,hz);
                 return 0;
             }
             return 0;
@@ -431,154 +574,7 @@ static LRESULT CALLBACK AcrylicSubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             HBITMAP hbm = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
             HBITMAP oldBm = (HBITMAP)SelectObject(memDC, hbm);
 
-            COLORREF bgCol = g_curDark ? RGB(24, 26, 32) : RGB(255, 255, 255);
-            COLORREF borderCol = g_curDark ? RGB(50, 54, 65) : RGB(205, 212, 222);
-            COLORREF hoverCol = g_curDark ? RGB(52, 58, 72) : RGB(232, 238, 248);
-            COLORREF textCol = g_curDark ? RGB(235, 240, 248) : RGB(20, 24, 32);
-            COLORREF checkCol = g_curDark ? RGB(96, 205, 255) : RGB(0, 110, 215);
-            COLORREF mutedCol = g_curDark ? RGB(140, 150, 165) : RGB(105, 115, 130);
-            COLORREF trackBgCol = g_curDark ? RGB(45, 50, 60) : RGB(215, 220, 230);
-
-            HBRUSH bgBrush = CreateSolidBrush(bgCol);
-            FillRect(memDC, &rc, bgBrush);
-            DeleteObject(bgBrush);
-
-            HPEN borderPen = CreatePen(PS_SOLID, 1, borderCol);
-            HGDIOBJ oldPen = SelectObject(memDC, borderPen);
-            HGDIOBJ oldBrush = SelectObject(memDC, GetStockObject(NULL_BRUSH));
-            RoundRect(memDC, 0, 0, rc.right, rc.bottom, S(12), S(12));
-            SelectObject(memDC, oldPen);
-            DeleteObject(borderPen);
-
-            HFONT hFontNormal = CreateFontW(-S(13), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
-            HFONT hFontBold = CreateFontW(-S(13), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-                                          DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                          CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
-            HFONT hFontSmall = CreateFontW(-S(11), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                           CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
-
-            SetBkMode(memDC, TRANSPARENT);
-            HGDIOBJ oldFont = SelectObject(memDC, hFontNormal);
-
-            if (g_activeSubId == 1) { // Polling Rate list
-                const WCHAR* labels[] = { L"125 Hz", L"250 Hz", L"500 Hz", L"1000 Hz", L"2000 Hz", L"4000 Hz", L"8000 Hz" };
-                const int hzVals[] = { 125, 250, 500, 1000, 2000, 4000, 8000 };
-                int currentHz = Device::GetCurrentState().pollingHz;
-
-                int count = 7;
-                int itemH = S(28);
-                int y = S(8);
-                for (int i = 0; i < count; i++) {
-                    RECT rItem = { S(6), y, rc.right - S(6), y + itemH };
-                    if (i == g_subHover) {
-                        HBRUSH hH = CreateSolidBrush(hoverCol);
-                        HPEN hP = CreatePen(PS_SOLID, 1, hoverCol);
-                        HGDIOBJ oP = SelectObject(memDC, hP);
-                        HGDIOBJ oB = SelectObject(memDC, hH);
-                        RoundRect(memDC, rItem.left, rItem.top + 1, rItem.right, rItem.bottom - 1, S(6), S(6));
-                        SelectObject(memDC, oP);
-                        SelectObject(memDC, oB);
-                        DeleteObject(hP);
-                        DeleteObject(hH);
-                    }
-
-                    SetTextColor(memDC, textCol);
-                    RECT rText = { S(14), y, rc.right - S(32), y + itemH };
-                    DrawTextW(memDC, labels[i], -1, &rText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-
-                    if (hzVals[i] == currentHz) {
-                        SetTextColor(memDC, checkCol);
-                        RECT rCheck = { rc.right - S(28), y, rc.right - S(10), y + itemH };
-                        DrawTextW(memDC, L"✓", -1, &rCheck, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-                    }
-                    y += itemH;
-                }
-            } else if (g_activeSubId == 2) { // Modern 2~120 min Interactive Sleep Slider
-                // Header Row: Label + Value
-                SelectObject(memDC, hFontNormal);
-                SetTextColor(memDC, textCol);
-                RECT rHeader = { S(16), S(14), rc.right - S(80), S(38) };
-                DrawTextW(memDC, L"休眠等待时间", -1, &rHeader, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-
-                SelectObject(memDC, hFontBold);
-                SetTextColor(memDC, checkCol);
-                WCHAR szVal[32];
-                StringCchPrintfW(szVal, ARRAYSIZE(szVal), L"%d 分钟", g_sliderVal);
-                RECT rVal = { rc.right - S(90), S(14), rc.right - S(16), S(38) };
-                DrawTextW(memDC, szVal, -1, &rVal, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-
-                // Slider Track
-                int trackX0 = S(20);
-                int trackX1 = rc.right - S(20);
-                int trackY = S(58);
-                int trackH = S(4);
-
-                double ratio = (double)(g_sliderVal - 2) / (double)(120 - 2);
-                ratio = std::clamp(ratio, 0.0, 1.0);
-                int thumbX = trackX0 + (int)(ratio * (trackX1 - trackX0));
-
-                // Draw background track (inactive portion)
-                HBRUSH hTrackBg = CreateSolidBrush(trackBgCol);
-                HGDIOBJ oP = SelectObject(memDC, GetStockObject(NULL_PEN));
-                HGDIOBJ oB = SelectObject(memDC, hTrackBg);
-                RoundRect(memDC, thumbX, trackY - trackH / 2, trackX1, trackY + trackH / 2 + 1, S(4), S(4));
-
-                // Draw filled track (active portion)
-                HBRUSH hTrackActive = CreateSolidBrush(checkCol);
-                SelectObject(memDC, hTrackActive);
-                RoundRect(memDC, trackX0, trackY - trackH / 2, thumbX, trackY + trackH / 2 + 1, S(4), S(4));
-
-                // Draw thumb
-                int thumbR = S(8);
-                HBRUSH hThumbBg = CreateSolidBrush(g_curDark ? RGB(255, 255, 255) : RGB(255, 255, 255));
-                HPEN hThumbBorder = CreatePen(PS_SOLID, 2, checkCol);
-                SelectObject(memDC, hThumbBorder);
-                SelectObject(memDC, hThumbBg);
-                Ellipse(memDC, thumbX - thumbR, trackY - thumbR, thumbX + thumbR, trackY + thumbR);
-
-                DeleteObject(hThumbBg);
-                DeleteObject(hThumbBorder);
-                DeleteObject(hTrackActive);
-                DeleteObject(hTrackBg);
-
-                // Preset Chips Row
-                SelectObject(memDC, hFontSmall);
-                int count = 5;
-                int chipW = (rc.right - S(40) - (count - 1) * S(6)) / count;
-                int curX = S(20);
-                int chipY0 = S(96);
-                int chipY1 = chipY0 + S(26);
-
-                for (int i = 0; i < count; i++) {
-                    RECT rChip = { curX, chipY0, curX + chipW, chipY1 };
-                    bool isCur = (g_sliderVal == PRESET_SLEEP[i]);
-
-                    HBRUSH hChipBg = CreateSolidBrush(isCur ? checkCol : (g_curDark ? RGB(36, 40, 50) : RGB(232, 236, 244)));
-                    HPEN hChipPen = CreatePen(PS_SOLID, 1, isCur ? checkCol : borderCol);
-                    SelectObject(memDC, hChipPen);
-                    SelectObject(memDC, hChipBg);
-                    RoundRect(memDC, rChip.left, rChip.top, rChip.right, rChip.bottom, S(6), S(6));
-                    DeleteObject(hChipPen);
-                    DeleteObject(hChipBg);
-
-                    SetTextColor(memDC, isCur ? (g_curDark ? RGB(10, 12, 16) : RGB(255, 255, 255)) : textCol);
-                    WCHAR szChip[16];
-                    StringCchPrintfW(szChip, ARRAYSIZE(szChip), L"%d分", PRESET_SLEEP[i]);
-                    DrawTextW(memDC, szChip, -1, &rChip, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-                    curX += chipW + S(6);
-                }
-            }
-
-            SelectObject(memDC, oldFont);
-            SelectObject(memDC, oldPen);
-            SelectObject(memDC, oldBrush);
-            DeleteObject(hFontNormal);
-            DeleteObject(hFontBold);
-            DeleteObject(hFontSmall);
+            DrawSubMenuSurface(memDC,rc);
 
             BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
             SelectObject(memDC, oldBm);
@@ -589,7 +585,11 @@ static LRESULT CALLBACK AcrylicSubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             return 0;
         }
 
+        case WM_TIMER:
+            if(wParam==WheelCommitTimer){KillTimer(hWnd,WheelCommitTimer);ApplySleepSlider();return 0;}
+            break;
         case WM_DESTROY:
+            KillTimer(hWnd,WheelCommitTimer);
             return 0;
     }
     return DefWindowProcW(hWnd, msg, wParam, lParam);
@@ -613,8 +613,8 @@ static void ShowSubMenuWindow(int subType, RECT rItemScreen) {
         s_subRegistered = true;
     }
 
-    int subW = (subType == 1) ? S(140) : S(260); // 260px wide for sleep slider
-    int subH = (subType == 1) ? S(212) : S(138); // 138px height for sleep slider
+    int subW = IsSleepSlider(subType) ? S(260) : S(140); // 260px wide for sleep slider
+    int subH = IsSleepSlider(subType) ? S(138) : subType==1 ? S(212) : S(156);
 
     HMONITOR hMon = MonitorFromPoint({ rItemScreen.left, rItemScreen.top }, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi = { sizeof(mi) };
@@ -630,8 +630,8 @@ static void ShowSubMenuWindow(int subType, RECT rItemScreen) {
     }
     if (subY < mi.rcWork.top) subY = mi.rcWork.top;
 
-    if (subType == 2) {
-        g_sliderVal = Device::GetCurrentState().sleepMinutes;
+    if (IsSleepSlider(subType)) {
+        g_sliderVal = ClampSlider(subType==5 ? (g_menuKeyboard.sleepSeconds+30)/60 : g_menuMouse.sleepMinutes);
     }
 
     g_hAcrylicSubMenu = CreateWindowExW(
@@ -660,14 +660,19 @@ struct MenuItemData {
     bool isSeparator;
     bool isInteractive;
     bool isDisabled;
-    int submenuType; // 0: None, 1: Polling, 2: Sleep
+    bool charging;
+    int submenuType; // 0: None, 1: Polling, 2: Sleep, 3: Brightness, 4: Effect speed
+    bool isModel;
+    bool connected;
+    bool wired;
 };
 
 static std::vector<MenuItemData> g_mainItems;
 
 static int GetItemH(int idx) {
     if (idx < 0 || idx >= (int)g_mainItems.size()) return 0;
-    if (g_mainItems[idx].isHeader) return S(52);
+    if (g_mainItems[idx].isHeader) return S(40);
+    if (g_mainItems[idx].isModel) return S(28);
     if (g_mainItems[idx].isSeparator) return S(9);
     return S(32);
 }
@@ -693,6 +698,155 @@ static int HitTestMain(int my) {
     return -1;
 }
 
+static bool pendingSettings[6]{};
+void SetSettingPending(int submenuType,bool pending) {
+    if(submenuType>0 && submenuType<6)pendingSettings[submenuType]=pending;
+}
+static std::vector<MenuItemData> BuildMainItems(const Device::State& st,const Keyboard::State& keyboard,bool autoEnabled) {
+    // Populate Menu Items
+    std::vector<MenuItemData> items;
+
+    MenuItemData itemHeader = { 0 };
+    itemHeader.isHeader = true;
+    itemHeader.label = L"鼠标";
+    itemHeader.charging=st.isConnected && st.batteryValid && st.isCharging;
+    if(st.isConnected && st.batteryValid)StringCchPrintfW(itemHeader.value,32,L"%d%%",st.battery);
+    else StringCchCopyW(itemHeader.value,32,L"—");
+    items.push_back(itemHeader);
+
+    MenuItemData itemBat = { 0 };
+    itemBat.label = L"VT3S MAX 大师版 V2";
+    itemBat.isModel=itemBat.isDisabled=true;itemBat.connected=st.isConnected;itemBat.wired=st.isWired;
+    items.push_back(itemBat);
+
+    MenuItemData itemDpi = { 0 };
+    itemDpi.label = L"DPI";
+    itemDpi.isDisabled = !st.isConnected;
+    if (st.isConnected) {
+        StringCchPrintfW(itemDpi.value, 32, L"%d", st.dpiX);
+    } else {
+        StringCchCopyW(itemDpi.value, 32, L"—");
+    }
+    items.push_back(itemDpi);
+
+    MenuItemData itemPoll = { 0 };
+    itemPoll.label = L"回报率";
+    itemPoll.isInteractive = true;
+    itemPoll.isDisabled = !st.isConnected || st.pollingHz<=0;
+    itemPoll.submenuType = 1;
+    if (st.isConnected && st.pollingHz>0) {
+        StringCchPrintfW(itemPoll.value, 32, L"%d Hz", st.pollingHz);
+    } else {
+        StringCchCopyW(itemPoll.value, 32, L"—");
+    }
+    items.push_back(itemPoll);
+
+    MenuItemData itemSleep = { 0 };
+    itemSleep.label = L"休眠";
+    itemSleep.isInteractive = true;
+    itemSleep.isDisabled = !st.isConnected || st.sleepMinutes<=0;
+    itemSleep.submenuType = 2; // Slider submenu
+    if (st.isConnected && st.sleepMinutes>0) {
+        StringCchPrintfW(itemSleep.value, 32, L"%d 分钟", st.sleepMinutes);
+    } else {
+        StringCchCopyW(itemSleep.value, 32, L"—");
+    }
+    items.push_back(itemSleep);
+
+    MenuItemData sepKeyboard = {0};sepKeyboard.isSeparator=true;items.push_back(sepKeyboard);
+    MenuItemData keyboardHeader = {0};keyboardHeader.isHeader=true;keyboardHeader.label=L"键盘";
+    keyboardHeader.charging=keyboard.isConnected && keyboard.batteryValid && keyboard.isCharging;
+    if(keyboard.isConnected && keyboard.batteryValid)StringCchPrintfW(keyboardHeader.value,32,L"%d%%",keyboard.battery);
+    else StringCchCopyW(keyboardHeader.value,32,L"—");items.push_back(keyboardHeader);
+    MenuItemData itemKeyboard = {0};
+    itemKeyboard.label=L"LEOBOG HI98C Pro";
+    itemKeyboard.isModel=itemKeyboard.isDisabled=true;itemKeyboard.connected=keyboard.isConnected;itemKeyboard.wired=keyboard.isWired;
+    items.push_back(itemKeyboard);
+
+    for(int type=3;type<=4;++type) {
+        MenuItemData light={0};light.label=type==3?L"灯光亮度":L"灯效速度";
+        light.isInteractive=true;light.isDisabled=!keyboard.isConnected || !keyboard.lightingValid || !keyboard.lightingWritable || keyboard.lightingStale;light.submenuType=type;
+        if(keyboard.isConnected && keyboard.lightingValid && !keyboard.lightingStale) {
+            StringCchPrintfW(light.value,32,L"%d%%",(type==3?keyboard.brightness:keyboard.lightSpeed)*25);
+        } else StringCchCopyW(light.value,32,L"—");
+        items.push_back(light);
+    }
+    MenuItemData keyboardSleep={0};keyboardSleep.label=L"休眠";keyboardSleep.isInteractive=true;
+    keyboardSleep.isDisabled=!keyboard.isConnected || !keyboard.sleepValid || !keyboard.lightingWritable || keyboard.sleepStale;keyboardSleep.submenuType=5;
+    if(keyboard.isConnected && keyboard.sleepValid && !keyboard.sleepStale) {
+        if(keyboard.sleepSeconds%60==0)StringCchPrintfW(keyboardSleep.value,32,L"%d 分钟",keyboard.sleepSeconds/60);
+        else StringCchPrintfW(keyboardSleep.value,32,L"%d 秒",keyboard.sleepSeconds);
+    } else StringCchCopyW(keyboardSleep.value,32,L"—");
+    items.push_back(keyboardSleep);
+
+    MenuItemData sep1 = { 0 };
+    sep1.isSeparator = true;
+    items.push_back(sep1);
+
+    MenuItemData itemAlerts = {1003};
+    itemAlerts.label=L"低电量提醒设置"; itemAlerts.isInteractive=true;
+    items.push_back(itemAlerts);
+
+    MenuItemData itemAuto = { 1001 };
+    itemAuto.label = L"开机自启动";
+    itemAuto.isInteractive = true;
+    StringCchCopyW(itemAuto.value, 32, autoEnabled ? Autostart::Label(g_autoState) :
+        g_autoState.status==Autostart::Status::Disabled?L"未开启":Autostart::Label(g_autoState));
+    items.push_back(itemAuto);
+
+    MenuItemData sep2 = { 0 };
+    sep2.isSeparator = true;
+    items.push_back(sep2);
+
+    MenuItemData itemExit = { 1002 };
+    itemExit.label = L"退出程序";
+    itemExit.isInteractive = true;
+    items.push_back(itemExit);
+
+    for(auto& item:items)if(item.submenuType>0 && pendingSettings[item.submenuType])item.isDisabled=true;
+    return items;
+}
+
+static void SetMenuSnapshot(const Device::State& mouse,const Keyboard::State& keyboard,bool autoEnabled) {
+    g_menuMouse=mouse;g_menuKeyboard=keyboard;
+    g_mainItems=BuildMainItems(g_menuMouse,g_menuKeyboard,autoEnabled);
+}
+void UpdateMenuState(const Device::State& mouse,const Keyboard::State& keyboard) {
+    if(!g_hAcrylicMenu)return;
+    SetMenuSnapshot(mouse,keyboard,IsAutoRunEnabled());
+    if(g_mainHover>=0 && g_mainItems[g_mainHover].isDisabled)DismissSubMenu();
+    InvalidateRect(g_hAcrylicMenu,nullptr,FALSE);
+    if(g_hAcrylicSubMenu)InvalidateRect(g_hAcrylicSubMenu,nullptr,FALSE);
+}
+
+static int MenuItemHeight(const MenuItemData& item,int dpi) {
+    return Ui::Scale(item.isHeader?40:item.isModel?28:item.isSeparator?9:32,dpi);
+}
+static void DrawMenuSurface(HDC hdc,const RECT& rc,int dpi,bool dark,const std::vector<MenuItemData>& items,int hover) {
+    (void)dark;auto S=[dpi](int n){return Ui::Scale(n,dpi);};
+    Ui::Surface(hdc,rc,dpi);int y=S(8);
+    for(size_t i=0;i<items.size();++i) {
+        const auto& item=items[i];int h=MenuItemHeight(item,dpi);
+        if(item.isSeparator) {HPEN p=CreatePen(PS_SOLID,1,Ui::Border);auto old=SelectObject(hdc,p);MoveToEx(hdc,S(14),y+S(4),nullptr);LineTo(hdc,rc.right-S(14),y+S(4));SelectObject(hdc,old);DeleteObject(p);}
+        else if(item.isHeader) {
+            bool keyboard=wcscmp(item.label,L"键盘")==0;Ui::DeviceIcon(hdc,S(17),y+S(7),dpi,keyboard);
+            Ui::Label(hdc,item.label,RECT{S(52),y,rc.right-S(110),y+h},16,dpi,Ui::Text,DT_LEFT,true);
+            Ui::Label(hdc,item.value,RECT{rc.right-S(110),y,rc.right-S(item.charging?37:18),y+h},25,dpi,Ui::Accent,DT_RIGHT,true);
+            if(item.charging)Ui::ChargeIcon(hdc,rc.right-S(30),y+S(11),dpi);
+        } else if(item.isModel) {
+            Ui::Label(hdc,item.label,RECT{S(18),y,rc.right-S(95),y+h},12,dpi,Ui::Muted);
+            Ui::Connection(hdc,RECT{rc.right-S(82),y+S(2),rc.right-S(18),y+S(26)},dpi,item.connected,item.wired);
+        } else {
+            if(int(i)==hover && item.isInteractive && !item.isDisabled)Ui::Box(hdc,RECT{S(8),y,rc.right-S(8),y+h},Ui::Control,Ui::Control,S(8));
+            bool arrow=item.submenuType>0 && !item.isDisabled;
+            Ui::Label(hdc,item.label,RECT{S(18),y,rc.right-S(item.value[0]?134:18),y+h},13,dpi,item.isDisabled?Ui::Muted:Ui::Text);
+            Ui::Label(hdc,item.value,RECT{rc.right-S(134),y,rc.right-S(arrow?37:18),y+h},13,dpi,Ui::Muted,DT_RIGHT);
+            if(arrow)Ui::Label(hdc,L"›",RECT{rc.right-S(31),y,rc.right-S(14),y+h},18,dpi,Ui::Muted,DT_CENTER);
+        }
+        y+=h;
+    }
+}
+
 static LRESULT CALLBACK AcrylicMainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_ACTIVATE: {
@@ -716,7 +870,7 @@ static LRESULT CALLBACK AcrylicMainWndProc(HWND hWnd, UINT msg, WPARAM wParam, L
                 InvalidateRect(hWnd, NULL, FALSE);
 
                 if (newH >= 0 && g_mainItems[newH].submenuType > 0 && !g_mainItems[newH].isDisabled) {
-                    RECT rcItem = { 0, GetItemY(newH), S(236), GetItemY(newH) + GetItemH(newH) };
+                    RECT rcItem = { 0, GetItemY(newH), S(320), GetItemY(newH) + GetItemH(newH) };
                     POINT ptTopLeft = { rcItem.left, rcItem.top };
                     POINT ptBottomRight = { rcItem.right, rcItem.bottom };
                     ClientToScreen(hWnd, &ptTopLeft);
@@ -754,8 +908,10 @@ static LRESULT CALLBACK AcrylicMainWndProc(HWND hWnd, UINT msg, WPARAM wParam, L
                 DismissAllMenus();
                 if (cmd == 1001) { // Toggle Auto Run
                     ToggleAutoRun();
+                } else if (cmd == 1003) {
+                    PostMessageW(g_hParentAppWnd,WM_APP+3,0,0);
                 } else if (cmd == 1002) { // Exit
-                    PostQuitMessage(0);
+                    PostMessageW(g_hParentAppWnd,WM_CLOSE,0,0);
                 }
             }
             return 0;
@@ -767,106 +923,7 @@ static LRESULT CALLBACK AcrylicMainWndProc(HWND hWnd, UINT msg, WPARAM wParam, L
             RECT rc;
             GetClientRect(hWnd, &rc);
 
-            HDC memDC = CreateCompatibleDC(hdc);
-            HBITMAP hbm = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
-            HBITMAP oldBm = (HBITMAP)SelectObject(memDC, hbm);
-
-            COLORREF bgCol = g_curDark ? RGB(24, 26, 32) : RGB(255, 255, 255);
-            COLORREF borderCol = g_curDark ? RGB(50, 54, 65) : RGB(205, 212, 222);
-            COLORREF hoverCol = g_curDark ? RGB(52, 58, 72) : RGB(232, 238, 248);
-            COLORREF textCol = g_curDark ? RGB(235, 240, 248) : RGB(20, 24, 32);
-            COLORREF mutedCol = g_curDark ? RGB(155, 165, 180) : RGB(105, 115, 130);
-            COLORREF greenCol = g_curDark ? RGB(34, 197, 94) : RGB(16, 145, 60);
-            COLORREF sepCol = g_curDark ? RGB(40, 44, 54) : RGB(225, 228, 236);
-            COLORREF checkCol = g_curDark ? RGB(96, 205, 255) : RGB(0, 110, 215);
-
-            HBRUSH bgBrush = CreateSolidBrush(bgCol);
-            FillRect(memDC, &rc, bgBrush);
-            DeleteObject(bgBrush);
-
-            HPEN borderPen = CreatePen(PS_SOLID, 1, borderCol);
-            HGDIOBJ oldPen = SelectObject(memDC, borderPen);
-            HGDIOBJ oldBrush = SelectObject(memDC, GetStockObject(NULL_BRUSH));
-            RoundRect(memDC, 0, 0, rc.right, rc.bottom, S(12), S(12));
-            SelectObject(memDC, oldPen);
-            DeleteObject(borderPen);
-
-            HFONT hFontNormal = CreateFontW(-S(13), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
-            HFONT hFontBold = CreateFontW(-S(14), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-                                          DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                          CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
-            HFONT hFontSub = CreateFontW(-S(11), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
-
-            SetBkMode(memDC, TRANSPARENT);
-            HGDIOBJ oldFont = SelectObject(memDC, hFontNormal);
-
-            int y = S(8);
-            for (size_t i = 0; i < g_mainItems.size(); i++) {
-                int h = GetItemH((int)i);
-                if (g_mainItems[i].isHeader) {
-                    SelectObject(memDC, hFontBold);
-                    SetTextColor(memDC, textCol);
-                    RECT rTitle = { S(16), y + S(4), rc.right - S(16), y + S(26) };
-                    DrawTextW(memDC, g_mainItems[i].label, -1, &rTitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-
-                    SelectObject(memDC, hFontSub);
-                    Device::State st = Device::GetCurrentState();
-                    SetTextColor(memDC, st.isConnected ? greenCol : mutedCol);
-                    RECT rSub = { S(16), y + S(26), rc.right - S(16), y + S(46) };
-                    DrawTextW(memDC, g_mainItems[i].value, -1, &rSub, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-                    y += h;
-                } else if (g_mainItems[i].isSeparator) {
-                    HPEN pSep = CreatePen(PS_SOLID, 1, sepCol);
-                    HGDIOBJ oP = SelectObject(memDC, pSep);
-                    MoveToEx(memDC, S(12), y + S(4), NULL);
-                    LineTo(memDC, rc.right - S(12), y + S(4));
-                    SelectObject(memDC, oP);
-                    DeleteObject(pSep);
-                    y += h;
-                } else {
-                    RECT rItem = { S(6), y, rc.right - S(6), y + h };
-                    if ((int)i == g_mainHover && g_mainItems[i].isInteractive && !g_mainItems[i].isDisabled) {
-                        HBRUSH hH = CreateSolidBrush(hoverCol);
-                        HPEN hP = CreatePen(PS_SOLID, 1, hoverCol);
-                        HGDIOBJ oP = SelectObject(memDC, hP);
-                        HGDIOBJ oB = SelectObject(memDC, hH);
-                        RoundRect(memDC, rItem.left, rItem.top + 1, rItem.right, rItem.bottom - 1, S(6), S(6));
-                        SelectObject(memDC, oP);
-                        SelectObject(memDC, oB);
-                        DeleteObject(hP);
-                        DeleteObject(hH);
-                    }
-
-                    SelectObject(memDC, hFontNormal);
-                    SetTextColor(memDC, g_mainItems[i].isDisabled ? mutedCol : textCol);
-                    RECT rLabel = { S(14), y, rc.right - S(90), y + h };
-                    DrawTextW(memDC, g_mainItems[i].label, -1, &rLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-
-                    if (g_mainItems[i].value[0]) {
-                        bool isCheck = (wcscmp(g_mainItems[i].value, L"✓ 已开启") == 0);
-                        SetTextColor(memDC, isCheck ? checkCol : mutedCol);
-                        RECT rVal = { rc.right - S(115), y, rc.right - S(14), y + h };
-                        DrawTextW(memDC, g_mainItems[i].value, -1, &rVal, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-                    }
-                    y += h;
-                }
-            }
-
-            SelectObject(memDC, oldFont);
-            SelectObject(memDC, oldPen);
-            SelectObject(memDC, oldBrush);
-            DeleteObject(hFontNormal);
-            DeleteObject(hFontBold);
-            DeleteObject(hFontSub);
-
-            BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
-            SelectObject(memDC, oldBm);
-            DeleteObject(hbm);
-            DeleteDC(memDC);
+            DrawMenuSurface(hdc,rc,g_curDpi,g_curDark,g_mainItems,g_mainHover);
 
             EndPaint(hWnd, &ps);
             return 0;
@@ -880,9 +937,9 @@ static LRESULT CALLBACK AcrylicMainWndProc(HWND hWnd, UINT msg, WPARAM wParam, L
 
 void ShowMenu(HWND hWndOwner) {
     if (g_bModalLoop) return;
-    Device::RefreshPollingRate();
+    Device::ForceRefresh();Keyboard::ForceRefresh(); // Show immediately; refresh in the reader, never block the menu.
     g_hParentAppWnd = hWndOwner;
-    g_curDark = IsSystemDarkMode();
+    g_curDark = true;
 
     POINT pt;
     GetCursorPos(&pt);
@@ -900,91 +957,13 @@ void ShowMenu(HWND hWndOwner) {
 
     Device::State st = Device::GetCurrentState();
 
-    // Populate Menu Items
-    g_mainItems.clear();
-
-    MenuItemData itemHeader = { 0 };
-    itemHeader.isHeader = true;
-    itemHeader.label = st.modelName[0] ? st.modelName : L"通用";
-    if (st.isConnected) {
-        StringCchCopyW(itemHeader.value, 32, st.isWired ? L"● USB 有线连接 · 已连接" : L"● 2.4G 无线连接 · 已连接");
-    } else {
-        StringCchCopyW(itemHeader.value, 32, L"● 设备休眠 / 未连接");
-    }
-    g_mainItems.push_back(itemHeader);
-
-    MenuItemData itemBat = { 0 };
-    itemBat.label = L"电池电量";
-    itemBat.isDisabled = !st.isConnected;
-    if (st.isConnected) {
-        if (st.isCharging) {
-            StringCchPrintfW(itemBat.value, 32, L"%d%% 充电中", st.battery);
-        } else {
-            StringCchPrintfW(itemBat.value, 32, L"%d%%", st.battery);
-        }
-    } else {
-        StringCchCopyW(itemBat.value, 32, L"--");
-    }
-    g_mainItems.push_back(itemBat);
-
-    MenuItemData itemDpi = { 0 };
-    itemDpi.label = L"DPI 档位";
-    itemDpi.isDisabled = !st.isConnected;
-    if (st.isConnected) {
-        StringCchPrintfW(itemDpi.value, 32, L"%d (第 %d 档)", st.dpiX, st.dpiLevel);
-    } else {
-        StringCchCopyW(itemDpi.value, 32, L"--");
-    }
-    g_mainItems.push_back(itemDpi);
-
-    MenuItemData itemPoll = { 0 };
-    itemPoll.label = L"回报率设置";
-    itemPoll.isInteractive = true;
-    itemPoll.isDisabled = !st.isConnected;
-    itemPoll.submenuType = 1;
-    if (st.isConnected) {
-        StringCchPrintfW(itemPoll.value, 32, L"%d Hz  ›", st.pollingHz);
-    } else {
-        StringCchCopyW(itemPoll.value, 32, L"--");
-    }
-    g_mainItems.push_back(itemPoll);
-
-    MenuItemData itemSleep = { 0 };
-    itemSleep.label = L"休眠时间设置";
-    itemSleep.isInteractive = true;
-    itemSleep.isDisabled = !st.isConnected;
-    itemSleep.submenuType = 2; // Slider submenu
-    if (st.isConnected) {
-        StringCchPrintfW(itemSleep.value, 32, L"%d 分钟  ›", st.sleepMinutes);
-    } else {
-        StringCchCopyW(itemSleep.value, 32, L"--");
-    }
-    g_mainItems.push_back(itemSleep);
-
-    MenuItemData sep1 = { 0 };
-    sep1.isSeparator = true;
-    g_mainItems.push_back(sep1);
-
-    MenuItemData itemAuto = { 1001 };
-    itemAuto.label = L"开机自启动";
-    itemAuto.isInteractive = true;
-    StringCchCopyW(itemAuto.value, 32, IsAutoRunEnabled() ? L"✓ 已开启" : L"未开启");
-    g_mainItems.push_back(itemAuto);
-
-    MenuItemData sep2 = { 0 };
-    sep2.isSeparator = true;
-    g_mainItems.push_back(sep2);
-
-    MenuItemData itemExit = { 1002 };
-    itemExit.label = L"退出程序";
-    itemExit.isInteractive = true;
-    g_mainItems.push_back(itemExit);
+    SetMenuSnapshot(st,Keyboard::GetCurrentState(),IsAutoRunEnabled());
 
     int totalH = S(16);
     for (size_t i = 0; i < g_mainItems.size(); i++) {
         totalH += GetItemH((int)i);
     }
-    int menuW = S(236);
+    int menuW = S(320);
 
     int posX = pt.x - S(10);
     int posY = pt.y - totalH - S(10);
@@ -1044,38 +1023,8 @@ void ShowMenu(HWND hWndOwner) {
 // Taskbar Battery Icon & Tooltip
 // --------------------------------------------------------------------------
 
-static const uint16_t FONT_5X9[10][9] = {
-    { 0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x11, 0x11, 0x0E },
-    { 0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E },
-    { 0x0E, 0x11, 0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F },
-    { 0x1E, 0x01, 0x01, 0x01, 0x0E, 0x01, 0x01, 0x01, 0x1E },
-    { 0x02, 0x06, 0x0A, 0x12, 0x12, 0x1F, 0x02, 0x02, 0x02 },
-    { 0x1F, 0x10, 0x10, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E },
-    { 0x06, 0x08, 0x10, 0x10, 0x1E, 0x11, 0x11, 0x11, 0x0E },
-    { 0x1F, 0x01, 0x02, 0x02, 0x04, 0x04, 0x08, 0x08, 0x08 },
-    { 0x0E, 0x11, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x11, 0x0E },
-    { 0x0E, 0x11, 0x11, 0x11, 0x0F, 0x01, 0x01, 0x02, 0x0C },
-};
-
-static const uint16_t FONT_4X9_0[9] = {
-    0x06, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x06
-};
-
-static const uint16_t FONT_3X5[10][5] = {
-    { 0x07, 0x05, 0x05, 0x05, 0x07 },
-    { 0x02, 0x06, 0x02, 0x02, 0x07 },
-    { 0x07, 0x01, 0x07, 0x04, 0x07 },
-    { 0x07, 0x01, 0x07, 0x01, 0x07 },
-    { 0x05, 0x05, 0x07, 0x01, 0x01 },
-    { 0x07, 0x04, 0x07, 0x01, 0x07 },
-    { 0x07, 0x04, 0x07, 0x05, 0x07 },
-    { 0x07, 0x01, 0x02, 0x02, 0x02 },
-    { 0x07, 0x05, 0x07, 0x05, 0x07 },
-    { 0x07, 0x05, 0x07, 0x01, 0x07 },
-};
-
-HICON CreateBatteryIcon(int battery, bool isCharging, bool isConnected, int size, bool isDark) {
-    if (size <= 0) size = 16;
+HICON CreateBatteryIcon(int battery, bool isCharging, bool isConnected, int size, bool isDark, int keyboardBattery, bool keyboardCharging, bool keyboardValid, int styleOverride) {
+    size = std::clamp(size,16,64);
     const int SS = 4;
     int W = size * SS;
     int H = size * SS;
@@ -1137,232 +1086,47 @@ HICON CreateBatteryIcon(int battery, bool isCharging, bool isConnected, int size
         }
     };
 
-    auto DrawBolt = [&](int sx, int sy, uint32_t col) {
-        static const char* pattern[7] = {
-            "..#",
-            ".##",
-            "###",
-            ".#.",
-            "##.",
-            "#..",
-            "..."
-        };
-        for (int r = 0; r < 7; ++r) {
-            for (int c = 0; c < 3; ++c) {
-                if (pattern[r][c] == '#') {
-                    for (int dy = 0; dy < SS; ++dy) {
-                        for (int dx = 0; dx < SS; ++dx) {
-                            HiPixel(sx + c * SS + dx, sy + r * SS + dy, col);
-                        }
-                    }
-                }
-            }
-        }
-    };
-
     auto L2S = [&](float v) {
         return (int)(v * (float)(size * SS) / 16.0f + 0.5f);
     };
 
-    int style = GetBatteryStyle();
+    int style = styleOverride>=0 ? std::clamp(styleOverride,0,2) : GetBatteryStyle();
 
-    // Style 0: 经典纯净电池胶囊 (复刻 logi-tray，1.5px 饱满外框 + 呼吸内边距，充电时居中纯白闪电)
-    if (style == 0) {
-        int bx0 = 0;
-        int by0 = L2S(2.5f);
-        int bw  = L2S(13.5f);
-        int bh  = L2S(11.0f);
-        int bx1 = bx0 + bw;
-        int by1 = by0 + bh;
-        int brad = L2S(2.5f);
-
-        uint32_t c_shell = isDark ? 0xFFFFFFFF : 0xFF334155;
-        uint32_t c_fill = isCharging ? 0xFF22C55E : ((battery <= 30) ? 0xFFEF4444 : 0xFF3B82F6);
-
-        // 1. 电池外壳
-        FillRoundRect(bx0, by0, bx1, by1, c_shell, brad);
-
-        // 2. 右侧正极端子
-        int cx0 = L2S(13.8f);
-        int cy0 = L2S(5.2f);
-        int cx1 = std::min(W - 1, cx0 + L2S(1.8f));
-        int cy1 = cy0 + L2S(5.6f);
-        FillRoundRect(cx0, cy0, cx1, cy1, c_shell, L2S(1.0f));
-
-        // 3. 掏空电池内部，形成 1.5px 饱满外框
-        int stroke_t = (int)(1.5f * SS + 0.5f);
-        int cav_x0 = bx0 + stroke_t;
-        int cav_y0 = by0 + stroke_t;
-        int cav_x1 = bx1 - stroke_t;
-        int cav_y1 = by1 - stroke_t;
-        FillRoundRect(cav_x0, cav_y0, cav_x1, cav_y1, 0, 0);
-
-        // 4. 内部电量填充（周围留出 0.75px 呼吸内边距，胶囊感更饱满敦实）
-        int pad = (int)(0.75f * SS + 0.5f);
-        int in_x0 = cav_x0 + pad;
-        int in_y0 = cav_y0 + pad;
-        int in_x1 = cav_x1 - pad;
-        int in_y1 = cav_y1 - pad;
-        int in_w  = in_x1 - in_x0 + 1;
-        int in_h  = in_y1 - in_y0 + 1;
-
-        if (isConnected && battery > 0) {
-            float ratio = std::clamp(battery / 100.0f, 0.08f, 1.0f);
-            int fill_w = std::max(L2S(2.0f), (int)(in_w * ratio));
-            FillRoundRect(in_x0, in_y0, in_x0 + fill_w, in_y1, c_fill, L2S(1.5f));
-        } else if (!isConnected) {
-            uint32_t c_dim = isDark ? 0x40606060 : 0x40B0B0B0;
-            FillRoundRect(in_x0, in_y0, in_x1, in_y1, c_dim, L2S(1.5f));
-            int dw = L2S(4.5f);
-            int dh = L2S(2.0f);
-            int sx = in_x0 + (in_w - dw) / 2;
-            int sy = in_y0 + (in_h - dh) / 2;
-            FillRoundRect(sx, sy, sx + dw, sy + dh, isDark ? 0xFFBBBBBB : 0xFF666666, 0);
-        }
-
-        // 5. 充电状态：内部居中纯白闪电符号
-        if (isCharging) {
-            int bolt_sx = cav_x0 + (cav_x1 - cav_x0 + 1 - 3 * SS) / 2;
-            int bolt_sy = cav_y0 + (cav_y1 - cav_y0 + 1 - 7 * SS) / 2;
-            DrawBolt(bolt_sx, bolt_sy, 0xFFFFFFFF);
-        }
-    }
-    // Style 1: 360° 环形电量进度圈 (复刻 logi-tray，加粗 3px 弧线，顺时针展开，圆弧两头圆角收口)
-    else if (style == 1) {
-        float cx = (float)W / 2.0f;
-        float cy = (float)H / 2.0f;
-        float R  = (float)(size * SS) * 5.8f / 16.0f;
-        float T  = (float)(size * SS) * 3.0f / 16.0f;
-
-        uint32_t c_track = isDark ? 0x40FFFFFF : 0x35000000;
-        uint32_t c_fill  = isCharging ? 0xFF22C55E : ((battery <= 30) ? 0xFFEF4444 : 0xFF3B82F6);
-
-        float sweep = isConnected ? std::clamp(360.0f * (battery / 100.0f), 0.0f, 360.0f) : 0.0f;
-        float sweep_rad = sweep * 3.141592653589793f / 180.0f;
-        float cap_r = T / 2.0f;
-        float cap_r2 = cap_r * cap_r;
-
-        float sx_cap = cx;
-        float sy_cap = cy - R;
-        float ex_cap = cx + R * std::sin(sweep_rad);
-        float ey_cap = cy - R * std::cos(sweep_rad);
-
-        int minX = std::max(0, (int)(cx - R - T));
-        int maxX = std::min(W - 1, (int)(cx + R + T));
-        int minY = std::max(0, (int)(cy - R - T));
-        int maxY = std::min(H - 1, (int)(cy + R + T));
-
-        for (int y = minY; y <= maxY; ++y) {
-            for (int x = minX; x <= maxX; ++x) {
-                float px = (float)x + 0.5f;
-                float py = (float)y + 0.5f;
-                float dx = px - cx;
-                float dy = py - cy;
-                float dist = std::sqrt(dx * dx + dy * dy);
-
-                // Round cap at start
-                if (isConnected && battery > 0 && ((px - sx_cap) * (px - sx_cap) + (py - sy_cap) * (py - sy_cap) <= cap_r2)) {
-                    HiPixel(x, y, c_fill);
-                    continue;
-                }
-                // Round cap at end
-                if (isConnected && battery > 0 && ((px - ex_cap) * (px - ex_cap) + (py - ey_cap) * (py - ey_cap) <= cap_r2)) {
-                    HiPixel(x, y, c_fill);
-                    continue;
-                }
-
-                if (std::abs(dist - R) <= cap_r) {
-                    if (isConnected && battery > 0) {
-                        float angle = std::atan2(dx, -dy) * (180.0f / 3.141592653589793f);
-                        if (angle < 0.0f) angle += 360.0f;
-                        if (angle <= sweep) {
-                            HiPixel(x, y, c_fill);
-                        } else {
-                            HiPixel(x, y, c_track);
-                        }
-                    } else {
-                        HiPixel(x, y, c_track);
-                    }
-                }
+    // All styles show mouse above keyboard. Blue = mouse; violet = keyboard.
+    static const uint16_t digits[10][5] = {
+        {7,5,5,5,7},{2,6,2,2,7},{7,1,7,4,7},{7,1,7,1,7},{5,5,7,1,1},
+        {7,4,7,1,7},{7,4,7,5,7},{7,1,1,1,1},{7,5,7,5,7},{7,5,7,1,7}
+    };
+    for(int row=0;row<2;++row) {
+        int percent=std::clamp(row?keyboardBattery:battery,0,100);
+        bool valid=row?keyboardValid:isConnected, charging=row?keyboardCharging:isCharging;
+        uint32_t color=!valid?0xFF94A3B8:charging?(isDark?0xFF22C55E:0xFF15803D):percent<=Alert::GetConfig(row).warning?(isDark?0xFFEF4444:0xFFB91C1C):row?(isDark?0xFFC4A5FF:0xFF6D28D9):(isDark?0xFF38BDF8:0xFF0369A1);
+        int top=L2S(row?9:1);
+        if(style==0 || style==2) {
+            wchar_t text[4]; if(valid) StringCchPrintfW(text,4,L"%d",percent); else StringCchCopyW(text,4,L"--");
+            int pixelScale=style==0?std::max(1,size/12):std::max(1,size/16);
+            pixelScale=std::min(pixelScale,std::max(1,(size/2-2)/5));
+            int scale=pixelScale*SS, count=int(wcslen(text)), start=((W-(count*4-1)*scale)/2/SS)*SS;
+            if(style==0)top=(row?size/2+1:1)*SS;
+            for(int i=0;i<count;++i) {
+                if(text[i]=='-') FillRoundRect(start+i*4*scale,top+2*scale,start+i*4*scale+2*scale,top+3*scale-1,color,0);
+                else DrawDigitScaled(digits[text[i]-L'0'],3,5,start+i*4*scale,top,scale,0,color);
             }
-        }
-
-        // Central charging bolt
-        if (isCharging) {
-            DrawBolt((W - 3 * SS) / 2, (H - 7 * SS) / 2, c_fill);
-        } else if (!isConnected) {
-            int dw = L2S(4.0f);
-            int dh = L2S(2.0f);
-            FillRoundRect((W - dw) / 2, (H - dh) / 2, (W + dw) / 2, (H + dh) / 2, isDark ? 0xFF888888 : 0xFF666666, 0);
-        }
-    }
-    // Style 2: 大号纯数字 + 底部细比例横轨 (复刻 logi-tray，大号粗体 Segoe UI，底部 2px 微横轨)
-    else {
-        COLORREF targetCol;
-        if (!isConnected) {
-            targetCol = isDark ? RGB(160, 160, 160) : RGB(100, 100, 100);
-        } else if (isCharging) {
-            targetCol = RGB(34, 197, 94); // Green
-        } else if (battery <= 30) {
-            targetCol = RGB(239, 68, 68); // Red
-        } else {
-            targetCol = isDark ? RGB(255, 255, 255) : RGB(20, 20, 20); // White / Dark
-        }
-
-        WCHAR sWide[16] = {0};
-        if (!isConnected) {
-            StringCchCopyW(sWide, ARRAYSIZE(sWide), L"-");
-        } else {
-            StringCchPrintfW(sWide, ARRAYSIZE(sWide), L"%d", battery);
-        }
-
-        int fontH = (battery == 100) ? (-H * 52 / 100) : (-H * 70 / 100);
-        HFONT hFont = CreateFontW(
-            fontH, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            ANTIALIASED_QUALITY, VARIABLE_PITCH, L"Segoe UI"
-        );
-
-        HGDIOBJ oldBm = SelectObject(hdcMem, hbmColor);
-        HFONT oldFont = (HFONT)SelectObject(hdcMem, hFont);
-        SetBkMode(hdcMem, TRANSPARENT);
-        SetTextColor(hdcMem, RGB(255, 255, 255));
-
-        int textH = (int)(H * 13.5f / 16.0f);
-        RECT rcText = { 0, -SS, W, textH }; // Optical baseline shift
-        DrawTextW(hdcMem, sWide, -1, &rcText, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-        GdiFlush();
-        SelectObject(hdcMem, oldFont);
-        DeleteObject(hFont);
-        SelectObject(hdcMem, oldBm);
-
-        uint8_t tR = GetRValue(targetCol);
-        uint8_t tG = GetGValue(targetCol);
-        uint8_t tB = GetBValue(targetCol);
-
-        for (int y = 0; y < textH; ++y) {
-            for (int x = 0; x < W; ++x) {
-                uint32_t raw = hi[y * W + x];
-                uint8_t gray = (raw & 0xFF);
-                if (gray > 0) {
-                    hi[y * W + x] = ((uint32_t)gray << 24) | ((uint32_t)tR << 16) | ((uint32_t)tG << 8) | tB;
-                } else {
-                    hi[y * W + x] = 0;
-                }
+            // Hybrid: a one-pixel progress bar under each number.
+            if(style==2) {
+                FillRoundRect(L2S(1),top+L2S(6),L2S(15)-1,top+L2S(7)-1,isDark?0xFF475569:0xFFCBD5E1,0);
+                int width=L2S(14)*percent/100;
+                if(valid && width>0) FillRoundRect(L2S(1),top+L2S(6),L2S(1)+width-1,top+L2S(7)-1,color,0);
             }
-        }
-
-        // Bottom 2px Mini Bar
-        int bar_y0 = (int)(H * 14.0f / 16.0f);
-        int bar_y1 = H - 1;
-        uint32_t c_track = isDark ? 0x40FFFFFF : 0x30000000;
-        FillRoundRect(0, bar_y0, W - 1, bar_y1, c_track, SS / 2);
-
-        if (isConnected && battery > 0) {
-            uint32_t c_fill = isCharging ? 0xFF22C55E : ((battery <= 30) ? 0xFFEF4444 : 0xFF3B82F6);
-            int bar_w = std::clamp((int)(W * (battery / 100.0f)), 2 * SS, W);
-            FillRoundRect(0, bar_y0, bar_w - 1, bar_y1, c_fill, SS / 2);
+        } else {
+            if(!valid) {
+                for(int x=L2S(1);x<L2S(15);x+=L2S(4)) FillRoundRect(x,top+L2S(2),x+L2S(2),top+L2S(3),color,0);
+                continue;
+            }
+            FillRoundRect(L2S(0),top,L2S(15),top+L2S(5),isDark?0xFFD7E0EC:0xFF334155,L2S(1));
+            FillRoundRect(L2S(1),top+L2S(1),L2S(14),top+L2S(4),isDark?0xFF18202B:0xFFF0F3F7,0);
+            int width=L2S(13)*percent/100;
+            if(width>0) FillRoundRect(L2S(1),top+L2S(1),L2S(1)+width-1,top+L2S(4),color,0);
         }
     }
 
@@ -1418,7 +1182,7 @@ HICON CreateBatteryIcon(int battery, bool isCharging, bool isConnected, int size
     }
 
     int maskPitch = ((size + 15) / 16) * 2;
-    BYTE maskBits[256] = {0};
+    std::vector<BYTE> maskBits(maskPitch * size);
     for (int y = 0; y < size; ++y) {
         for (int x = 0; x < size; ++x) {
             uint32_t px = out[y * size + x];
@@ -1428,7 +1192,7 @@ HICON CreateBatteryIcon(int battery, bool isCharging, bool isConnected, int size
             }
         }
     }
-    HBITMAP hbmMask = CreateBitmap(size, size, 1, 1, maskBits);
+    HBITMAP hbmMask = CreateBitmap(size, size, 1, 1, maskBits.data());
 
     ICONINFO ii = {0};
     ii.fIcon = TRUE;
@@ -1445,42 +1209,19 @@ HICON CreateBatteryIcon(int battery, bool isCharging, bool isConnected, int size
     return hIcon;
 }
 
-void UpdateTooltip(NOTIFYICONDATAW& nid, const Device::State& state) {
-    if (state.isConnected) {
-        const WCHAR* modeStr = state.isWired ? L" (USB)" : L" (2.4G)";
-        if (state.isCharging) {
-            StringCchPrintfW(
-                nid.szTip,
-                ARRAYSIZE(nid.szTip),
-                L"%s%s\n电量: %d%% (充电中)\nDPI: %d (第 %d 档)\n回报率: %d Hz",
-                state.modelName,
-                modeStr,
-                state.battery,
-                state.dpiX,
-                state.dpiLevel,
-                state.pollingHz
-            );
-        } else {
-            StringCchPrintfW(
-                nid.szTip,
-                ARRAYSIZE(nid.szTip),
-                L"%s%s\n电量: %d%%\nDPI: %d (第 %d 档)\n回报率: %d Hz",
-                state.modelName,
-                modeStr,
-                state.battery,
-                state.dpiX,
-                state.dpiLevel,
-                state.pollingHz
-            );
-        }
-    } else {
-        StringCchPrintfW(
-            nid.szTip,
-            ARRAYSIZE(nid.szTip),
-            L"%s\n设备休眠 / 未连接",
-            state.modelName[0] ? state.modelName : L"通用"
-        );
-    }
+void UpdateTooltip(NOTIFYICONDATAW& nid, const Device::State& state, const Keyboard::State& keyboard) {
+    wchar_t m[64],k[64];
+    StringCchPrintfW(nid.szTip,ARRAYSIZE(nid.szTip),L"%s: %s\n%s: %s\n鼠标 DPI %d · %d Hz",
+        state.modelName,Battery::Description(state.isConnected,state.batteryValid,state.battery,state.isCharging,state.isWired,m,64),
+        keyboard.modelName,Battery::Description(keyboard.isConnected,keyboard.batteryValid,keyboard.battery,keyboard.isCharging,keyboard.isWired,k,64),state.dpiX,state.pollingHz);
+}
+
+SIZE DrawMenuPreview(HDC dc,int dpi,bool dark,const Device::State& mouse,const Keyboard::State& keyboard) {
+    auto items=BuildMainItems(mouse,keyboard,false);
+    int height=MulDiv(16,dpi,96);
+    for(const auto& item:items)height+=MenuItemHeight(item,dpi);
+    RECT rect{0,0,MulDiv(320,dpi,96),height};
+    DrawMenuSurface(dc,rect,dpi,dark,items,-1);return {rect.right,rect.bottom};
 }
 
 } // namespace Tray

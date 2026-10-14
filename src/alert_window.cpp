@@ -1,10 +1,13 @@
 #include "alert_window.h"
+#include "ui_theme.h"
 #include <windows.h>
 #include <windowsx.h>
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <strsafe.h>
 #include <algorithm>
+#include <deque>
+#include <string>
 
 namespace Alert {
 
@@ -19,8 +22,61 @@ static bool s_btnHover = false;
 static bool s_closeHover = false;
 static bool s_trackingMouse = false;
 
-static bool s_alerted20 = false;
-static bool s_alerted10 = false;
+static AlertPolicy::Config configs[2];
+static AlertPolicy::Tracker trackers[2];
+struct Pending {
+    int device; std::wstring name; int battery; bool critical, wired;
+    bool consumedWarning=false,consumedCritical=false;
+};
+static std::deque<Pending> pending;
+static int activeDevice = -1;
+static void ShowNext() {
+    if(!g_hAlertWnd || s_isShown || pending.empty()) return;
+    auto next = pending.front(); pending.pop_front(); activeDevice = next.device;
+    Show(next.name.c_str(),next.battery,next.critical,next.wired);
+}
+static void CancelDevice(int id) {
+    // Queueing reserves a notification; only a displayed card consumes it.
+    for(const auto& p:pending) if(p.device==id) {
+        if(p.consumedWarning)trackers[id].warned=false;
+        if(p.consumedCritical)trackers[id].critical=false;
+    }
+    pending.erase(std::remove_if(pending.begin(),pending.end(),[id](const Pending& p){return p.device==id;}),pending.end());
+    // Advance only after both devices have been checked: the next card may
+    // itself have recovered since it was queued.
+    if(activeDevice==id) {
+        if(g_hAlertWnd) ShowWindow(g_hAlertWnd,SW_HIDE);
+        s_isShown=false;activeDevice=-1;
+    }
+}
+static void LoadConfig() {
+    HKEY key;
+    if(RegOpenKeyExW(HKEY_CURRENT_USER,L"Software\\rapoo-tray",0,KEY_QUERY_VALUE,&key)!=ERROR_SUCCESS)return;
+    DWORD data[7]{};DWORD size=sizeof(data),type=0;
+    if(RegQueryValueExW(key,L"DualBatteryAlerts",nullptr,&type,(BYTE*)data,&size)==ERROR_SUCCESS && type==REG_BINARY && size==sizeof(data) && data[0]==1) {
+        AlertPolicy::Config candidate[2];
+        for(int i=0;i<2;++i)candidate[i]={data[1+i*3]!=0,int(data[2+i*3]),int(data[3+i*3])};
+        if(AlertPolicy::Valid(candidate[0]) && AlertPolicy::Valid(candidate[1]))for(int i=0;i<2;++i)configs[i]=candidate[i];
+    }
+    RegCloseKey(key);
+}
+AlertPolicy::Config GetConfig(int id) { return configs[id==1?1:0]; }
+bool SaveConfig(const AlertPolicy::Config (&config)[2]) {
+    if(!AlertPolicy::Valid(config[0])||!AlertPolicy::Valid(config[1])) return false;
+    DWORD data[7]={1};for(int i=0;i<2;++i){data[1+i*3]=config[i].enabled;data[2+i*3]=config[i].warning;data[3+i*3]=config[i].critical;}
+    HKEY key;if(RegCreateKeyExW(HKEY_CURRENT_USER,L"Software\\rapoo-tray",0,nullptr,0,KEY_SET_VALUE,nullptr,&key,nullptr)!=ERROR_SUCCESS)return false;
+    LONG result=RegSetValueExW(key,L"DualBatteryAlerts",0,REG_BINARY,(BYTE*)data,sizeof(data));RegCloseKey(key);
+    if(result!=ERROR_SUCCESS)return false;
+    for(int i=0;i<2;++i){
+        bool thresholdsChanged = configs[i].warning != config[i].warning || configs[i].critical != config[i].critical;
+        bool changed = thresholdsChanged || configs[i].enabled != config[i].enabled;
+        configs[i]=config[i];
+        if(thresholdsChanged) trackers[i]={};
+        if(changed) CancelDevice(i);
+    }
+    ShowNext();
+    return true;
+}
 
 static inline int ScaleDpi(int val, int dpi) {
     return MulDiv(val, dpi, 96);
@@ -152,6 +208,19 @@ static void GetButtonRects(HWND hWnd, RECT* pClose, RECT* pConfirm) {
     }
 }
 
+void DrawAlert(HDC dc,int dpi,const wchar_t* model,int battery,bool critical,bool buttonHover,bool closeHover) {
+    auto S=[dpi](int n){return Ui::Scale(n,dpi);};RECT rc{0,0,S(390),S(150)};Ui::Surface(dc,rc,dpi);
+    COLORREF warning=critical?RGB(255,160,164):RGB(231,182,121);
+    Ui::Box(dc,RECT{S(14),S(14),S(119),S(136)},Ui::Control,Ui::Control,S(20));
+    wchar_t value[16];StringCchPrintfW(value,16,L"%d%%",battery);Ui::Label(dc,value,RECT{S(17),S(40),S(116),S(101)},30,dpi,warning,DT_CENTER,true);
+    bool keyboard=model && wcsstr(model,L"LEOBOG");
+    Ui::Label(dc,keyboard?(critical?L"键盘电量很低":L"键盘电量偏低"):(critical?L"鼠标电量很低":L"鼠标电量偏低"),RECT{S(135),S(17),S(354),S(48)},17,dpi,Ui::Text,DT_LEFT,true);
+    Ui::Label(dc,critical?L"请及时充电":L"建议充电",RECT{S(136),S(53),S(365),S(78)},13,dpi,Ui::Muted);
+    Ui::Box(dc,RECT{S(282),S(112),S(374),S(138)},buttonHover?Ui::Accent:Ui::Control,Ui::Border,S(8));
+    Ui::Label(dc,L"我知道了",RECT{S(282),S(112),S(374),S(138)},12,dpi,buttonHover?Ui::Background:Ui::Text,DT_CENTER);
+    Ui::Label(dc,L"×",RECT{S(356),S(10),S(380),S(34)},17,dpi,closeHover?Ui::Text:Ui::Muted,DT_CENTER);
+}
+
 static LRESULT CALLBACK AlertWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_ERASEBKGND:
@@ -212,142 +281,7 @@ static LRESULT CALLBACK AlertWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
         }
 
         case WM_PAINT: {
-            PAINTSTRUCT ps;
-            HDC hdc = BeginPaint(hWnd, &ps);
-            RECT rc;
-            GetClientRect(hWnd, &rc);
-
-            HDC memDC = CreateCompatibleDC(hdc);
-            HBITMAP memBmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
-            HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
-
-            UINT dpi = GetCurrentWindowDpi(hWnd);
-            auto S = [dpi](int v) { return ScaleDpi(v, dpi); };
-
-            bool isDark = IsSystemDark();
-
-            COLORREF bgCol = isDark ? RGB(24, 27, 36) : RGB(255, 255, 255);
-            COLORREF borderCol = s_isCritical ? RGB(239, 68, 68) : RGB(245, 158, 11);
-            COLORREF titleCol  = s_isCritical ? RGB(239, 68, 68) : RGB(245, 158, 11);
-            COLORREF textMain  = isDark ? RGB(241, 245, 249) : RGB(15, 23, 42);
-            COLORREF textSub   = isDark ? RGB(148, 163, 184) : RGB(100, 116, 139);
-
-            // 1. Pre-fill background to ensure 100% clean solid surface
-            HBRUSH hBg = CreateSolidBrush(bgCol);
-            FillRect(memDC, &rc, hBg);
-            DeleteObject(hBg);
-
-            // 2. Draw 1px perimeter border without leaking background outside
-            HPEN hBorder = CreatePen(PS_SOLID, 1, borderCol);
-            HGDIOBJ oB = SelectObject(memDC, GetStockObject(NULL_BRUSH));
-            HGDIOBJ oP = SelectObject(memDC, hBorder);
-            RoundRect(memDC, 0, 0, rc.right, rc.bottom, S(16), S(16));
-            SelectObject(memDC, oB);
-            SelectObject(memDC, oP);
-            DeleteObject(hBorder);
-
-            SetBkMode(memDC, TRANSPARENT);
-
-            // Fonts
-            HFONT hFontTitle = CreateFontW(-S(15), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-                                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                           CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Microsoft YaHei UI");
-            HFONT hFontBody = CreateFontW(-S(12), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                          DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                          CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Microsoft YaHei UI");
-            HFONT hFontSmall = CreateFontW(-S(11), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                           CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Microsoft YaHei UI");
-
-            // 1. Title Row: Icon + Title
-            HGDIOBJ oF = SelectObject(memDC, hFontTitle);
-            SetTextColor(memDC, titleCol);
-
-            WCHAR szTitle[64];
-            if (s_isCritical) {
-                StringCchPrintfW(szTitle, ARRAYSIZE(szTitle), L"⚠️  严重低电量警告 (%d%%)", s_battery);
-            } else {
-                StringCchPrintfW(szTitle, ARRAYSIZE(szTitle), L"🪫  电量不足 (%d%%)", s_battery);
-            }
-            RECT rTitle = { S(18), S(12), rc.right - S(40), S(34) };
-            DrawTextW(memDC, szTitle, -1, &rTitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-
-            // Close button [✕]
-            RECT rClose, rConfirm;
-            GetButtonRects(hWnd, &rClose, &rConfirm);
-
-            if (s_closeHover) {
-                HBRUSH hCloseBg = CreateSolidBrush(isDark ? RGB(50, 56, 70) : RGB(232, 238, 248));
-                HPEN hNoPen = CreatePen(PS_NULL, 0, 0);
-                SelectObject(memDC, hCloseBg);
-                SelectObject(memDC, hNoPen);
-                RoundRect(memDC, rClose.left, rClose.top, rClose.right, rClose.bottom, S(6), S(6));
-                DeleteObject(hCloseBg);
-                DeleteObject(hNoPen);
-            }
-
-            SelectObject(memDC, hFontBody);
-            SetTextColor(memDC, s_closeHover ? (isDark ? RGB(255, 255, 255) : RGB(0, 0, 0)) : RGB(148, 163, 184));
-            DrawTextW(memDC, L"✕", -1, &rClose, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-            // 2. Middle Info Rows
-            SelectObject(memDC, hFontBody);
-            SetTextColor(memDC, textMain);
-
-            const WCHAR* mName = s_modelName[0] ? s_modelName : L"通用";
-            const WCHAR* modeStr = s_isWired ? L"USB 有线模式" : L"2.4G 无线模式";
-            WCHAR szDev[96];
-            StringCchPrintfW(szDev, ARRAYSIZE(szDev), L"设备：%s  ·  %s", mName, modeStr);
-            RECT rDev = { S(18), S(38), rc.right - S(18), S(58) };
-            DrawTextW(memDC, szDev, -1, &rDev, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-
-            SelectObject(memDC, hFontSmall);
-            SetTextColor(memDC, s_isCritical ? (isDark ? RGB(252, 165, 165) : RGB(220, 38, 38)) : textSub);
-
-            const WCHAR* szAdvice = s_isCritical
-                ? L"鼠标即将耗尽电量自动关机，请立即连接充电器！"
-                : L"剩余电量较低，建议适时连接 USB 线缆充电";
-            RECT rAdvice = { S(18), S(58), rc.right - S(18), S(78) };
-            DrawTextW(memDC, szAdvice, -1, &rAdvice, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-
-            // 3. Confirm Button [ 我知道了 ]
-            HBRUSH hBtnBg;
-            HPEN hBtnPen;
-            COLORREF cBtnText;
-
-            if (s_btnHover) {
-                hBtnBg = CreateSolidBrush(borderCol);
-                hBtnPen = CreatePen(PS_SOLID, 1, borderCol);
-                cBtnText = RGB(255, 255, 255);
-            } else {
-                hBtnBg = CreateSolidBrush(isDark ? RGB(36, 41, 54) : RGB(241, 245, 249));
-                hBtnPen = CreatePen(PS_SOLID, 1, isDark ? RGB(60, 68, 86) : RGB(203, 213, 225));
-                cBtnText = isDark ? RGB(226, 232, 240) : RGB(30, 41, 59);
-            }
-
-            SelectObject(memDC, hBtnBg);
-            SelectObject(memDC, hBtnPen);
-            RoundRect(memDC, rConfirm.left, rConfirm.top, rConfirm.right, rConfirm.bottom, S(6), S(6));
-            DeleteObject(hBtnBg);
-            DeleteObject(hBtnPen);
-
-            SelectObject(memDC, hFontBody);
-            SetTextColor(memDC, cBtnText);
-            DrawTextW(memDC, L"我知道了", -1, &rConfirm, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-            // Clean fonts
-            SelectObject(memDC, oF);
-            DeleteObject(hFontTitle);
-            DeleteObject(hFontBody);
-            DeleteObject(hFontSmall);
-
-            BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
-            SelectObject(memDC, oldBmp);
-            DeleteObject(memBmp);
-            DeleteDC(memDC);
-
-            EndPaint(hWnd, &ps);
-            return 0;
+            PAINTSTRUCT ps;HDC dc=BeginPaint(hWnd,&ps);RECT rc;GetClientRect(hWnd,&rc);DrawAlert(dc,GetCurrentWindowDpi(hWnd),s_modelName,s_battery,s_isCritical,s_btnHover,s_closeHover);EndPaint(hWnd,&ps);return 0;
         }
 
         case WM_DESTROY:
@@ -360,6 +294,7 @@ static LRESULT CALLBACK AlertWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
 }
 
 void Init(HINSTANCE hInstance) {
+    LoadConfig();
     WNDCLASSEXW wc = { 0 };
     wc.cbSize        = sizeof(wc);
     wc.style         = CS_HREDRAW | CS_VREDRAW;
@@ -384,17 +319,20 @@ void Init(HINSTANCE hInstance) {
         DWORD corner = 2; // DWMWCP_ROUND
         DwmSetWindowAttribute(g_hAlertWnd, 33, &corner, sizeof(corner));
 
-        BOOL isDark = IsSystemDark();
+        BOOL isDark = TRUE;
         DwmSetWindowAttribute(g_hAlertWnd, 20, &isDark, sizeof(isDark));
     }
 }
 
 void Cleanup() {
+    CloseSettings();
     if (g_hAlertWnd && IsWindow(g_hAlertWnd)) {
         DestroyWindow(g_hAlertWnd);
         g_hAlertWnd = NULL;
     }
     s_isShown = false;
+    activeDevice=-1;pending.clear();
+    for(auto& tracker:trackers)tracker={};
 }
 
 void Show(const WCHAR* modelName, int battery, bool isCritical, bool isWired) {
@@ -410,19 +348,20 @@ void Show(const WCHAR* modelName, int battery, bool isCritical, bool isWired) {
     }
 
     if (!g_hAlertWnd) return;
+    SetWindowTextW(g_hAlertWnd,s_modelName);
 
     // Dynamically update DWM border color (Warning: Amber / Critical: Red)
     COLORREF borderCol = s_isCritical ? RGB(239, 68, 68) : RGB(245, 158, 11);
     DwmSetWindowAttribute(g_hAlertWnd, 34, &borderCol, sizeof(borderCol));
 
-    BOOL isDark = IsSystemDark();
+    BOOL isDark = TRUE;
     DwmSetWindowAttribute(g_hAlertWnd, 20, &isDark, sizeof(isDark));
 
     UINT dpi = GetCurrentWindowDpi(g_hAlertWnd);
     auto S = [dpi](int v) { return ScaleDpi(v, dpi); };
 
-    int targetW = S(310);
-    int targetH = S(116);
+    int targetW = S(390);
+    int targetH = S(150);
 
     // Calculate dynamic position hugging the taskbar
     int x = 0, y = 0;
@@ -444,46 +383,53 @@ void Show(const WCHAR* modelName, int battery, bool isCritical, bool isWired) {
 void Hide() {
     if (g_hAlertWnd) {
         ShowWindow(g_hAlertWnd, SW_HIDE);
-        s_isShown = false;
     }
+    s_isShown = false;
+    activeDevice = -1;
+    ShowNext();
 }
 
-void CheckBattery(const Device::State& state) {
-    if (!state.isConnected) {
+static void CheckOne(int id, const wchar_t* name, bool connected, bool fresh, int battery, bool charging, bool wired) {
+    const auto previous=trackers[id];
+    int level=trackers[id].Evaluate(configs[id],connected,fresh,battery,charging);
+    // Evaluate may rearm and warn in the same call at the 100% boundary.
+    // The event, rather than the previous cycle's flags, identifies its reservation.
+    const bool reserveWarning=level==1 || (level==2 && !previous.warned);
+    const bool reserveCritical=level==2;
+    if (!configs[id].enabled || !connected || !fresh || charging || battery<0 || battery>configs[id].warning) {
+        CancelDevice(id);return;
+    }
+    const bool critical=battery<=configs[id].critical;
+    if(activeDevice==id && s_isShown) {
+        // Update the current card in place, including an immediate escalation.
+        if(s_battery!=battery || s_isCritical!=critical || s_isWired!=wired)
+            Show(name,battery,critical,wired);
         return;
     }
-
-    // Auto-dismiss if user starts charging
-    if (state.isCharging) {
-        if (s_isShown) {
-            Hide();
+    for(auto& item:pending) if(item.device==id) {
+        if(level) {
+            item.consumedWarning=item.consumedWarning || reserveWarning;
+            item.consumedCritical=item.consumedCritical || reserveCritical;
         }
-        // Reset alert triggers if charged back up
-        if (state.battery >= 25) {
-            s_alerted20 = false;
-            s_alerted10 = false;
+        if(item.critical && !critical && item.consumedCritical) {
+            trackers[id].critical=false;item.consumedCritical=false;
+            // A warning already displayed earlier in this cycle must not be
+            // displayed again merely because its queued escalation recovered.
+            if(!item.consumedWarning){CancelDevice(id);return;}
         }
+        item.name=name;item.battery=battery;item.critical=critical;item.wired=wired;
         return;
     }
-
-    // Reset when battery is restored above 25%
-    if (state.battery >= 25) {
-        s_alerted20 = false;
-        s_alerted10 = false;
-        return;
+    if(level){
+        pending.erase(std::remove_if(pending.begin(),pending.end(),[id](const Pending& p){return p.device==id;}),pending.end());
+        pending.push_back({id,name,battery,critical,wired,
+            reserveWarning,reserveCritical});
     }
-
-    // Level 2: Critical alert (<= 10%)
-    if (state.battery <= 10 && !s_alerted10) {
-        s_alerted10 = true;
-        s_alerted20 = true;
-        Show(state.modelName, state.battery, true, state.isWired);
-    }
-    // Level 1: Warning alert (<= 20%)
-    else if (state.battery <= 20 && !s_alerted20) {
-        s_alerted20 = true;
-        Show(state.modelName, state.battery, false, state.isWired);
-    }
+}
+void CheckBattery(const Device::State& mouse, const Keyboard::State& keyboard) {
+    CheckOne(0,mouse.modelName,mouse.isConnected,mouse.batteryValid,mouse.battery,mouse.isCharging,mouse.isWired);
+    CheckOne(1,keyboard.modelName,keyboard.isConnected,keyboard.batteryValid,keyboard.battery,keyboard.chargingKnown && keyboard.isCharging,keyboard.isWired);
+    ShowNext();
 }
 
 } // namespace Alert

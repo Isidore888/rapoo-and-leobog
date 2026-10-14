@@ -19,3 +19,12 @@ dist/
 # OS temporary files
 Thumbs.db
 Desktop.ini
+
+# Local planning, hardware evidence and generated verification output
+task_plan.md
+findings.md
+progress.md
+verification/
+handoffs/
+.planning/
+__pycache__/
