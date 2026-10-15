@@ -74,8 +74,12 @@ static bool PublishSetting(const ProfileStamp& stamp, int value, bool sleep) {
 // Consume the write response before issuing a read, as the official A Hub SDK does.
 static bool WaitSettingReply(BYTE expectedLen, BYTE* value=nullptr, bool drain=false) {
     for(int poll=0;poll<6;++poll) {
-        Sleep(poll?100:40);
-        if(g_hStopEvent && WaitForSingleObject(g_hStopEvent,0)==WAIT_OBJECT_0)return false;
+        DWORD delay = poll ? 100 : 40;
+        if (g_hStopEvent) {
+            if (WaitForSingleObject(g_hStopEvent, delay) == WAIT_OBJECT_0) return false;
+        } else {
+            Sleep(delay);
+        }
         BYTE reply[33]{};reply[0]=Rapoo::REPORT_ID_FEATURE;
         if(!HidD_GetFeature(g_hFeatureDev,reply,sizeof(reply))) {
 #ifdef RAPOO_DIAGNOSTIC
@@ -220,6 +224,7 @@ static void RefreshSleepTimeout(bool request=true) {
     LeaveCriticalSection(&g_csState);
     auto now=GetTickCount64();
     if(!pending || !g_allowSettingsQueries || g_controlBlocked ||
+       g_hControlDev==INVALID_HANDLE_VALUE || g_hFeatureDev==INVALID_HANDLE_VALUE ||
        (g_lastSettingsQuery && now-g_lastSettingsQuery<60000)) {
         LeaveCriticalSection(&g_csDevIO);return;
     }
@@ -271,6 +276,7 @@ static DWORD ApplyPassiveStatus(const Rapoo::DeviceStatus& status, bool wired, b
 // Only identities observed on the user's VT3S MAX Master V2 are accepted.
 static bool FindRapooEndpoints(WCHAR* pathStatus, WCHAR* pathControl, WCHAR* pathFeature,
                                WCHAR* outModel, int maxModelLen, bool* outIsWired, USHORT excludePid=0) {
+    Hid::ScopedVidFilter vidFilter(0x24AE);
     auto endpoints = Hid::Enumerate();
     for (USHORT pid : {USHORT(0x466E), USHORT(0x146E)}) {
         if(pid==excludePid)continue;
@@ -315,6 +321,7 @@ static bool KeepCurrentStatus(const WCHAR* current) {
 }
 
 static DWORD WINAPI HidWorkerThread(LPVOID lpParam) {
+    (void)lpParam;
     WCHAR pathStatus[MAX_PATH] = {0};
     WCHAR pathControl[MAX_PATH] = {0};
     WCHAR pathFeature[MAX_PATH] = {0};
@@ -339,9 +346,11 @@ static DWORD WINAPI HidWorkerThread(LPVOID lpParam) {
         EnterCriticalSection(&g_csDevIO);
         g_controlWired=isWired;g_controlBlocked=false;g_replyPending=false;g_lastManualFailure=0;g_lastSettingsQuery=0;
         if (pathControl[0]) {
+            // Usage 14 only sends Output reports; avoid GENERIC_READ so hidclass.sys
+            // does not allocate an unused input report queue on the control handle.
             g_hControlDev = CreateFileW(
                 pathControl,
-                GENERIC_READ | GENERIC_WRITE,
+                GENERIC_WRITE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 NULL,
                 OPEN_EXISTING,
@@ -351,7 +360,7 @@ static DWORD WINAPI HidWorkerThread(LPVOID lpParam) {
             if (g_hControlDev == INVALID_HANDLE_VALUE) {
                 g_hControlDev = CreateFileW(
                     pathControl,
-                    GENERIC_WRITE,
+                    GENERIC_READ | GENERIC_WRITE,
                     FILE_SHARE_READ | FILE_SHARE_WRITE,
                     NULL,
                     OPEN_EXISTING,
@@ -361,9 +370,10 @@ static DWORD WINAPI HidWorkerThread(LPVOID lpParam) {
             }
         }
         if (pathFeature[0]) {
+            // Usage 15 is a Feature-only collection; DesiredAccess=0 is sufficient for HidD_GetFeature.
             g_hFeatureDev = CreateFileW(
                 pathFeature,
-                GENERIC_READ | GENERIC_WRITE,
+                0,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 NULL,
                 OPEN_EXISTING,
@@ -373,18 +383,7 @@ static DWORD WINAPI HidWorkerThread(LPVOID lpParam) {
             if (g_hFeatureDev == INVALID_HANDLE_VALUE) {
                 g_hFeatureDev = CreateFileW(
                     pathFeature,
-                    GENERIC_READ,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    NULL,
-                    OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL,
-                    NULL
-                );
-            }
-            if (g_hFeatureDev == INVALID_HANDLE_VALUE) {
-                g_hFeatureDev = CreateFileW(
-                    pathFeature,
-                    0,
+                    GENERIC_READ | GENERIC_WRITE,
                     FILE_SHARE_READ | FILE_SHARE_WRITE,
                     NULL,
                     OPEN_EXISTING,
@@ -419,67 +418,76 @@ static DWORD WINAPI HidWorkerThread(LPVOID lpParam) {
         BYTE buf[65] = {0};
         DWORD bytesRead = 0;
         bool gotFirstPacket = false; // Initial reports establish DPI without showing a change notification.
+        bool readArmed = false;
         ULONGLONG openedAt=GetTickCount64();
 
         while (WaitForSingleObject(g_hStopEvent, 0) == WAIT_TIMEOUT) {
             // A slot switch inside the cooldown schedules one deferred read.
             // With no pending request this performs no HID transaction.
             ScheduleSleepRefresh(false);
-            ResetEvent(hReadEvent);
-            BOOL ok = ReadFile(hStatus, buf, 19, &bytesRead, &ov);
-            if (!ok) {
-                DWORD err = GetLastError();
-                if (err == ERROR_IO_PENDING) {
-                    HANDLE waitHandles[4] = { g_hStopEvent, hReadEvent, g_hDevChangeEvent, g_hRefreshEvent };
-                    DWORD waitMs = 3000;
-                    DWORD waitRes = WaitForMultipleObjects(4, waitHandles, FALSE, waitMs);
+            if (!readArmed) {
+                ResetEvent(hReadEvent);
+                ov = {0};
+                ov.hEvent = hReadEvent;
+                BOOL ok = ReadFile(hStatus, buf, 19, &bytesRead, &ov);
+                if (!ok) {
+                    if (GetLastError() != ERROR_IO_PENDING) break;
+                    readArmed = true;
+                }
+            }
+            if (readArmed) {
+                HANDLE waitHandles[4] = { g_hStopEvent, hReadEvent, g_hDevChangeEvent, g_hRefreshEvent };
+                DWORD waitMs = 3000;
+                DWORD waitRes = WaitForMultipleObjects(4, waitHandles, FALSE, waitMs);
 
-                    if (waitRes == WAIT_OBJECT_0) {
-                        CancelIoEx(hStatus, &ov);
-                        GetOverlappedResult(hStatus, &ov, &bytesRead, TRUE);
+                if (waitRes == WAIT_OBJECT_0) {
+                    CancelIoEx(hStatus, &ov);
+                    GetOverlappedResult(hStatus, &ov, &bytesRead, TRUE);
+                    readArmed = false;
+                    break;
+                } else if (waitRes == WAIT_OBJECT_0 + 2) {
+                    // PnP Debounce: Windows composite device sends multiple arrival messages.
+                    // Drain any consecutive events within 600ms before handling reconnect.
+                    Sleep(600);
+                    while (WaitForSingleObject(g_hDevChangeEvent, 0) == WAIT_OBJECT_0) {
+                        ResetEvent(g_hDevChangeEvent);
+                        Sleep(100);
+                    }
+                    if(KeepCurrentStatus(pathStatus))continue;
+                    CancelIoEx(hStatus, &ov);
+                    GetOverlappedResult(hStatus, &ov, &bytesRead, TRUE);
+                    readArmed = false;
+                    break;
+                } else if(waitRes==WAIT_OBJECT_0+3) {
+                    if(!KeepCurrentStatus(pathStatus)) {
+                        CancelIoEx(hStatus,&ov);
+                        GetOverlappedResult(hStatus,&ov,&bytesRead,TRUE);
+                        readArmed = false;
                         break;
-                    } else if (waitRes == WAIT_OBJECT_0 + 2) {
-                        // PnP Debounce: Windows composite device sends multiple arrival messages.
-                        // Drain any consecutive events within 600ms before handling reconnect.
-                        Sleep(600);
-                        while (WaitForSingleObject(g_hDevChangeEvent, 0) == WAIT_OBJECT_0) {
-                            ResetEvent(g_hDevChangeEvent);
-                            Sleep(100);
-                        }
-                        CancelIoEx(hStatus, &ov);
-                        GetOverlappedResult(hStatus, &ov, &bytesRead, TRUE);
-                        if(KeepCurrentStatus(pathStatus))continue;
-                        break;
-                    } else if(waitRes==WAIT_OBJECT_0+3) {
-                        CancelIoEx(hStatus,&ov);GetOverlappedResult(hStatus,&ov,&bytesRead,TRUE);
-                        if(!KeepCurrentStatus(pathStatus))break;
-                        ScheduleSleepRefresh();
-                        continue;
-                    } else if (waitRes == WAIT_TIMEOUT) {
-                        CancelIoEx(hStatus, &ov);
-                        GetOverlappedResult(hStatus, &ov, &bytesRead, TRUE);
-
-                        // No heartbeat commands: expire a silent wireless
-                        // device using the same freshness bound as its battery.
-                        EnterCriticalSection(&g_csState);
-                        bool expired=!isWired && g_currentState.isConnected &&
-                            !(gotFirstPacket ? Battery::Fresh(true,g_currentState.lastBatteryUpdate) :
-                              GetTickCount64()-openedAt<=Battery::FreshnessMs);
-                        if(expired){g_currentState.isConnected=false;g_currentState.isCharging=false;++g_profileRevision;}
-                        State stale=g_currentState;
-                        LeaveCriticalSection(&g_csState);
-                        if(expired && g_callback)g_callback(stale,CHANGE_CONNECTED|CHANGE_BATTERY);
-                        continue;
-                    } else if (waitRes == WAIT_OBJECT_0 + 1) {
-                        if (!GetOverlappedResult(hStatus, &ov, &bytesRead, FALSE)) {
-                            break;
-                        }
-                    } else {
-                        CancelIoEx(hStatus, &ov);
-                        GetOverlappedResult(hStatus, &ov, &bytesRead, TRUE);
+                    }
+                    ScheduleSleepRefresh();
+                    continue;
+                } else if (waitRes == WAIT_TIMEOUT) {
+                    // Keep the pending overlapped ReadFile armed across idle timeouts
+                    // instead of canceling and re-submitting IRPs every 3 seconds.
+                    EnterCriticalSection(&g_csState);
+                    bool expired=!isWired && g_currentState.isConnected &&
+                        !(gotFirstPacket ? Battery::Fresh(true,g_currentState.lastBatteryUpdate) :
+                          GetTickCount64()-openedAt<=Battery::FreshnessMs);
+                    if(expired){g_currentState.isConnected=false;g_currentState.isCharging=false;++g_profileRevision;}
+                    State stale=g_currentState;
+                    LeaveCriticalSection(&g_csState);
+                    if(expired && g_callback)g_callback(stale,CHANGE_CONNECTED|CHANGE_BATTERY);
+                    continue;
+                } else if (waitRes == WAIT_OBJECT_0 + 1) {
+                    readArmed = false;
+                    if (!GetOverlappedResult(hStatus, &ov, &bytesRead, FALSE)) {
                         break;
                     }
                 } else {
+                    CancelIoEx(hStatus, &ov);
+                    GetOverlappedResult(hStatus, &ov, &bytesRead, TRUE);
+                    readArmed = false;
                     break;
                 }
             }
@@ -501,6 +509,12 @@ static DWORD WINAPI HidWorkerThread(LPVOID lpParam) {
                 }
                 if(querySleep)ScheduleSleepRefresh();
             }
+        }
+
+        if (readArmed) {
+            CancelIoEx(hStatus, &ov);
+            GetOverlappedResult(hStatus, &ov, &bytesRead, TRUE);
+            readArmed = false;
         }
 
         EnterCriticalSection(&g_csState);

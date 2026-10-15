@@ -32,6 +32,11 @@ struct PauseRadio {
 };
 static thread_local LightingResult readIssue=LightingResult::ReadFailed;
 static thread_local LightingResult writeIssue=LightingResult::WriteFailed;
+static bool PauseBetweenUsbCommands(DWORD ms=15) {
+    if(stopEvent)return WaitForSingleObject(stopEvent,ms)==WAIT_TIMEOUT;
+    Sleep(ms);
+    return true;
+}
 static bool WiredExchange(HANDLE h, BYTE cmd, BYTE param, BYTE len, BYTE* reply);
 static bool ReadWiredLighting(HANDLE h,BYTE* page) {
     readIssue=LightingResult::ReadFailed;
@@ -48,12 +53,16 @@ static bool WiredExchange(HANDLE h, BYTE cmd, BYTE param, BYTE len, BYTE* reply)
     if (!Hid::Feature(h,reply,520,true,150,stopEvent)){trace.result=4;return false;}
     // A feature response may still be the previous command. Poll reads only;
     // send the query once, and never accept a mismatched header.
+    // Guard against launching a 520-byte EP0 GET_FEATURE with <15ms remaining,
+    // which would time out mid-transfer and trigger CancelIoEx on EP0.
+    constexpr ULONGLONG MinGetBudgetMs=15;
     do {
-        auto now=GetTickCount64();if(now>=deadline){trace.result=2;return false;}
-        DWORD delay=DWORD(std::min<ULONGLONG>(25,deadline-now));
+        auto now=GetTickCount64();if(now>=deadline || deadline-now<=MinGetBudgetMs){trace.result=2;return false;}
+        DWORD delay=DWORD(std::min<ULONGLONG>(25,deadline-now-MinGetBudgetMs));
+        if(delay<5)delay=DWORD(std::min<ULONGLONG>(25,deadline-now));
         if(stopEvent) {if(WaitForSingleObject(stopEvent,delay)!=WAIT_TIMEOUT){trace.result=6;return false;}}
         else Sleep(delay);
-        now=GetTickCount64();if(now>=deadline){trace.result=2;return false;}
+        now=GetTickCount64();if(now>=deadline || deadline-now<MinGetBudgetMs){trace.result=2;return false;}
         std::fill(reply,reply+520,0);reply[0]=6;
         DWORD received=0;
         if(Hid::Feature(h,reply,520,false,DWORD(deadline-now),stopEvent,&received)) {
@@ -119,6 +128,7 @@ static bool WriteWirelessLighting(HANDLE h,const BYTE* page) {
     Sleep(100);return true;
 }
 static State QueryUnlocked(bool readLighting=true) {
+    Hid::ScopedVidFilter vidFilter(0x258A);
     auto endpoints = Hid::Enumerate();
     State result;
     // USB wins only when this exact keyboard's identity and power reply validate.
@@ -139,9 +149,11 @@ static State QueryUnlocked(bool readLighting=true) {
             result=State{};
             result.isConnected = true; result.isWired = wired;
             result.lightingWritable=true;
+            if(wired && !PauseBetweenUsbCommands(10)){CloseHandle(h);Diagnostics::Log("usb_handle_closed");return result;}
             ok = wired ? (WiredExchange(h,0x87,2,2,reply) && KeyboardProtocol::WiredPower(reply,520,power)) : (WirelessExchange(h,0x0B,reply,false) && KeyboardProtocol::WirelessPower(reply,20,power));
             if(wired && !ok)Diagnostics::Log("power_rejected",0,0x87,2);
             if(readLighting) {
+                if(wired && !PauseBetweenUsbCommands(10)){CloseHandle(h);Diagnostics::Log("usb_handle_closed");return result;}
                 BYTE page[128];KeyboardProtocol::Lighting light;
                 if(wired?ReadWiredLighting(h,page):ReadWirelessLighting(h,page)) {
                     if(KeyboardProtocol::ParseLighting(page,128,light)) {
@@ -172,6 +184,7 @@ static State QueryLightingUnlocked(const State& previous) {
     next.configResult=LightingResult::Unavailable;next.lightingWritable=false;
     if(!previous.isConnected)return next;
     const bool wired=previous.isWired;
+    Hid::ScopedVidFilter vidFilter(0x258A);
     auto endpoints=Hid::Enumerate();
     for(const auto& ep:endpoints) {
         if(stopEvent && WaitForSingleObject(stopEvent,0)==WAIT_OBJECT_0)return next;
@@ -183,7 +196,7 @@ static State QueryLightingUnlocked(const State& previous) {
         BYTE reply[520]{},page[128]{};
         bool identity=wired ? WiredExchange(h,0x82,1,6,reply) && KeyboardProtocol::WiredIdentity(reply,520) : WirelessExchange(h,5,reply,true);
         if(identity && !wired)verifiedRadioPath=ep.path;
-        bool read=identity && (wired?ReadWiredLighting(h,page):ReadWirelessLighting(h,page));
+        bool read=identity && (!wired || PauseBetweenUsbCommands(10)) && (wired?ReadWiredLighting(h,page):ReadWirelessLighting(h,page));
         CloseHandle(h);
         if(wired)Diagnostics::Log("usb_handle_closed");
         if(!read){next.configResult=identity?readIssue:LightingResult::Unavailable;continue;}
@@ -210,6 +223,7 @@ static LightingResult SetSettingLocked(KeyboardProtocol::Setting setting,int val
     if(sleep?(value<30 || value>7200 || value%30):(value<0 || value>4))return LightingResult::InvalidValue;
     if(stopEvent && WaitForSingleObject(stopEvent,0)==WAIT_OBJECT_0)return LightingResult::Superseded;
     if(expected && !SameContext(*expected))return LightingResult::Superseded;
+    Hid::ScopedVidFilter vidFilter(0x258A);
     auto endpoints=Hid::Enumerate();
     for(int mode=0;mode<2;++mode)for(const auto& ep:endpoints) {
         bool wired=mode==0;
@@ -221,10 +235,10 @@ static LightingResult SetSettingLocked(KeyboardProtocol::Setting setting,int val
         BYTE reply[520]{},page[128]{},confirmed[128]{};
         bool identity=wired ? WiredExchange(h,0x82,1,6,reply) && KeyboardProtocol::WiredIdentity(reply,520) : WirelessExchange(h,5,reply,true);
         if(identity && !wired)verifiedRadioPath=ep.path;
-        if(!identity){CloseHandle(h);continue;}
+        if(!identity){CloseHandle(h);if(wired)Diagnostics::Log("usb_handle_closed");continue;}
         LightingResult result=LightingResult::ReadFailed;
         bool attempted=false;
-        if(wired?ReadWiredLighting(h,page):ReadWirelessLighting(h,page)) {
+        if((!wired || PauseBetweenUsbCommands(10)) && (wired?ReadWiredLighting(h,page):ReadWirelessLighting(h,page))) {
             BYTE original[128];std::copy(page,page+128,original);
             KeyboardProtocol::Lighting light;int seconds=0;
             bool contextOk=!expected || (SameContext(*expected) && KeyboardProtocol::ParseLighting(page,128,light) &&
@@ -234,19 +248,23 @@ static LightingResult SetSettingLocked(KeyboardProtocol::Setting setting,int val
             else if(!(sleep?KeyboardProtocol::PatchSleep(page,128,value):KeyboardProtocol::PatchLighting(page,128,setting==KeyboardProtocol::Setting::Speed,value)))result=LightingResult::UnsupportedConfig;
             else if(std::equal(page,page+128,original)) {
                 std::copy(original,original+128,confirmed);result=LightingResult::Confirmed; // Fresh full read, no setting write.
-              } else if(stopEvent && WaitForSingleObject(stopEvent,0)==WAIT_OBJECT_0)result=LightingResult::Superseded;
-              else {
-                attempted=true;KeyboardProtocol::WiredRequest(4,0,128,reply);std::copy(page,page+128,reply+8);
-                if(!(wired?Hid::Feature(h,reply,520,true,150,stopEvent):WriteWirelessLighting(h,page)))result=wired?LightingResult::WriteFailed:writeIssue;
+            } else if(stopEvent && WaitForSingleObject(stopEvent,0)==WAIT_OBJECT_0)result=LightingResult::Superseded;
+            else {
+                if(wired && !PauseBetweenUsbCommands(15))result=LightingResult::Superseded;
                 else {
-                    Sleep(25);
-                    if(!(wired?ReadWiredLighting(h,confirmed):ReadWirelessLighting(h,confirmed)))result=LightingResult::ReadbackFailed;
-                    else result=std::equal(page,page+128,confirmed)?LightingResult::Confirmed:LightingResult::ReadbackMismatch;
+                    attempted=true;KeyboardProtocol::WiredRequest(4,0,128,reply);std::copy(page,page+128,reply+8);
+                    if(!(wired?Hid::Feature(h,reply,520,true,150,stopEvent):WriteWirelessLighting(h,page)))result=wired?LightingResult::WriteFailed:writeIssue;
+                    else {
+                        Sleep(25);
+                        if(!(wired?ReadWiredLighting(h,confirmed):ReadWirelessLighting(h,confirmed)))result=LightingResult::ReadbackFailed;
+                        else result=std::equal(page,page+128,confirmed)?LightingResult::Confirmed:LightingResult::ReadbackMismatch;
+                    }
                 }
             }
         } else result=readIssue;
         if(expected && !SameContext(*expected))result=LightingResult::Superseded;
         CloseHandle(h);
+        if(wired)Diagnostics::Log("usb_handle_closed");
         {
             std::lock_guard<std::mutex> lock(mutex);
             if(expected && (!state.isConnected || state.connectionGeneration!=expected->connectionGeneration ||
@@ -417,21 +435,22 @@ static DWORD WINAPI Worker(void*) {
                     radioHinted=false;
                 }
                 if(radioInputFaulted)radioHints.Disable();
-            }
-            if(hintGeneration!=published.connectionGeneration) {
-                hintInput.Close();hints.Reset(now);hintGeneration=published.connectionGeneration;
-                if(!published.isConnected || !published.isWired || !published.lightingValid || !hintInput.Attach())hints.Disable();
-                hinted=false;
+                if(hintGeneration!=published.connectionGeneration) {
+                    hintInput.Close();hints.Reset(now);hintGeneration=published.connectionGeneration;
+                    if(!published.isConnected || !published.isWired || !published.lightingValid || !hintInput.Attach())hints.Disable();
+                    hinted=false;
+                }
             }
             if(readLighting)hints.Read(next.lightingValid && next.sleepValid,
                 next.brightness!=previous.brightness || next.lightSpeed!=previous.lightSpeed || next.lightEffect!=previous.lightEffect,hinted,now);
             if(readLighting)radioHints.Read(next.lightingValid && next.sleepValid && (!radioHinted || next.batteryValid),
                 next.brightness!=previous.brightness || next.lightSpeed!=previous.lightSpeed || next.lightEffect!=previous.lightEffect ||
                     next.sleepSeconds!=previous.sleepSeconds || next.battery!=previous.battery,radioHinted,now);
-            if(!radioHints.enabled) {
-                std::lock_guard<std::mutex> ioLock(ioMutex);radioContextEnabled=false;radioInput.Pause();
+            if(!radioHints.enabled || !hints.enabled) {
+                std::lock_guard<std::mutex> ioLock(ioMutex);
+                if(!radioHints.enabled){radioContextEnabled=false;radioInput.Pause();}
+                if(!hints.enabled)hintInput.Close();
             }
-            if(!hints.enabled)hintInput.Close();
             PostMessageW(notifyWindow,updateMessage,0,0);
             if(changes)PostMessageW(notifyWindow,SettingsChangedMessage,changes,static_cast<LPARAM>(revision));
         }
@@ -448,6 +467,7 @@ static DWORD WINAPI Worker(void*) {
         }
         if(usbIndex!=MAXDWORD && wait==WAIT_OBJECT_0+usbIndex) {
             std::array<BYTE,4> report{};DWORD count=0;
+            std::lock_guard<std::mutex> ioLock(ioMutex);
             if(!hintInput.Consume(report,count))hints.Disable();
             else {
                 const bool accepted=hints.Hint(report.data(),count,WorkerClock());
@@ -495,7 +515,7 @@ void BeginShutdown() {
 void Stop() {
     BeginShutdown();
     if (worker) { CancelSynchronousIo(worker); WaitForSingleObject(worker,INFINITE); CloseHandle(worker); worker=nullptr; }
-    {std::lock_guard<std::mutex> ioLock(ioMutex);radioContextEnabled=false;radioInput.Close();}
+    {std::lock_guard<std::mutex> ioLock(ioMutex);radioContextEnabled=false;radioInput.Close();verifiedRadioPath.clear();}
     if (stopEvent) {CloseHandle(stopEvent);stopEvent=nullptr;}
     if (refreshEvent) {CloseHandle(refreshEvent);refreshEvent=nullptr;}
     {std::lock_guard<std::mutex> lock(mutex);manualRefreshPending=deviceChangePending=false;}

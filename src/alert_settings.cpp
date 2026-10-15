@@ -52,7 +52,8 @@ static RECT PageRect() {
 }
 static LRESULT CALLBACK EnableProc(HWND h,UINT msg,WPARAM wp,LPARAM lp) {
     if(msg==WM_PAINT || msg==WM_PRINTCLIENT) {
-        PAINTSTRUCT ps{};HDC dc=msg==WM_PAINT?BeginPaint(h,&ps):(HDC)wp;RECT r;GetClientRect(h,&r);
+        PAINTSTRUCT ps{};HDC targetDc=msg==WM_PAINT?BeginPaint(h,&ps):(HDC)wp;RECT r;GetClientRect(h,&r);
+        HDC dc=CreateCompatibleDC(targetDc);HBITMAP bmp=CreateCompatibleBitmap(targetDc,r.right,r.bottom);auto oldBmp=SelectObject(dc,bmp);
         HBRUSH b=CreateSolidBrush(Ui::Background);FillRect(dc,&r,b);DeleteObject(b);
         bool on=SendMessageW(h,BM_GETCHECK,0,0)==BST_CHECKED;
         COLORREF accent=GetDlgCtrlID(h)==210?Ui::Keyboard:Ui::Accent;
@@ -61,7 +62,10 @@ static LRESULT CALLBACK EnableProc(HWND h,UINT msg,WPARAM wp,LPARAM lp) {
         Ui::Box(dc,toggle,on?accent:Ui::Border,on?accent:Ui::Border,Scale(20));
         int x=toggle.left+Scale(on?20:3);Ui::Box(dc,RECT{x,toggle.top+Scale(3),x+Scale(13),toggle.top+Scale(16)},Ui::Background,Ui::Background,Scale(13));
         if(GetFocus()==h && !(SendMessageW(h,WM_QUERYUISTATE,0,0)&UISF_HIDEFOCUS))DrawFocusRect(dc,&r);
-        if(msg==WM_PAINT)EndPaint(h,&ps);return 0;
+        BitBlt(targetDc,0,0,r.right,r.bottom,dc,0,0,SRCCOPY);
+        SelectObject(dc,oldBmp);DeleteObject(bmp);DeleteDC(dc);
+        if(msg==WM_PAINT)EndPaint(h,&ps);
+        return 0;
     }
     auto result=CallWindowProcW(enableProc,h,msg,wp,lp);
     if(msg==BM_SETCHECK || msg==WM_SETFOCUS || msg==WM_KILLFOCUS)InvalidateRect(h,nullptr,FALSE);
@@ -117,7 +121,8 @@ static LRESULT CALLBACK SettingsProc(HWND h,UINT msg,WPARAM wp,LPARAM lp) {
         }
     }
     if(msg==WM_PAINT || msg==WM_PRINTCLIENT) {
-        PAINTSTRUCT ps{};HDC dc=msg==WM_PAINT?BeginPaint(h,&ps):(HDC)wp;RECT r;GetClientRect(h,&r);
+        PAINTSTRUCT ps{};HDC targetDc=msg==WM_PAINT?BeginPaint(h,&ps):(HDC)wp;RECT r;GetClientRect(h,&r);
+        HDC dc=CreateCompatibleDC(targetDc);HBITMAP bmp=CreateCompatibleBitmap(targetDc,r.right,r.bottom);auto oldBmp=SelectObject(dc,bmp);
         HBRUSH b=CreateSolidBrush(Ui::Background);FillRect(dc,&r,b);DeleteObject(b);
         Ui::Label(dc,L"低电量提醒",RECT{Scale(24),Scale(20),Scale(536),Scale(54)},22,dpi,Ui::Text,DT_LEFT,true);
         Ui::Label(dc,L"设备",RECT{Scale(24),Scale(78),Scale(148),Scale(106)},13,dpi,Ui::Muted);
@@ -134,7 +139,10 @@ static LRESULT CALLBACK SettingsProc(HWND h,UINT msg,WPARAM wp,LPARAM lp) {
                 Ui::Box(dc,RECT{Scale(x),Scale(y),Scale(x+88),Scale(y+40)},Ui::Control,border,Scale(10));}
         }
         if(!settingsError.empty())Ui::Label(dc,settingsError.c_str(),RECT{Scale(24),Scale(283),Scale(536),Scale(306)},12,dpi,RGB(255,184,138));
-        if(msg==WM_PAINT)EndPaint(h,&ps);return 0;
+        BitBlt(targetDc,0,0,r.right,r.bottom,dc,0,0,SRCCOPY);
+        SelectObject(dc,oldBmp);DeleteObject(bmp);DeleteDC(dc);
+        if(msg==WM_PAINT)EndPaint(h,&ps);
+        return 0;
     }
     if(msg==WM_DRAWITEM) {
         auto item=(DRAWITEMSTRUCT*)lp;bool save=item->CtlID==IDOK,pressed=item->itemState&ODS_SELECTED;

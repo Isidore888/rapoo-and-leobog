@@ -39,6 +39,10 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & .\bin\regression_tests.exe
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($SelectedUi) {
+    & g++ -std=c++17 -DUNICODE -D_UNICODE -O2 tests/ui_refresh_tests.cpp src/rapoo_protocol.cpp src/device_manager.cpp src/keyboard_manager.cpp src/hid_transport.cpp src/autostart.cpp src/tray_menu.cpp src/alert_window.cpp src/alert_settings.cpp -lsetupapi -lhid -luser32 -lgdi32 -lshell32 -ladvapi32 -luxtheme -ldwmapi -o bin/ui_refresh_tests.exe
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    & .\bin\ui_refresh_tests.exe
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     & g++ -std=c++17 -DUNICODE -D_UNICODE -O2 tests/selected_ui_tests.cpp src/rapoo_protocol.cpp src/device_manager.cpp src/keyboard_manager.cpp src/hid_transport.cpp src/autostart.cpp -lsetupapi -lhid -luser32 -lgdi32 -lshell32 -ladvapi32 -luxtheme -ldwmapi -o bin/selected_ui_tests.exe
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     & .\bin\selected_ui_tests.exe --settings-only

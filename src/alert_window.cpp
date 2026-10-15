@@ -95,19 +95,6 @@ static UINT GetCurrentWindowDpi(HWND hWnd) {
     return 96;
 }
 
-static bool IsSystemDark() {
-    HKEY hKey;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        DWORD val = 1, size = sizeof(DWORD), type = 0;
-        if (RegQueryValueExW(hKey, L"SystemUsesLightTheme", NULL, &type, (LPBYTE)&val, &size) == ERROR_SUCCESS) {
-            RegCloseKey(hKey);
-            return (val == 0);
-        }
-        RegCloseKey(hKey);
-    }
-    return true;
-}
-
 static void CalculateAlertPosition(int targetW, int targetH, int dpi, int* outX, int* outY) {
     auto S = [dpi](int v) { return ScaleDpi(v, dpi); };
 
@@ -145,25 +132,21 @@ static void CalculateAlertPosition(int targetW, int targetH, int dpi, int* outX,
     if (hasAppBar) {
         switch (abd.uEdge) {
             case ABE_BOTTOM: {
-                // Taskbar is at bottom: abd.rc.top is the dynamic top edge
                 *outX = rcWork.right - targetW - marginSide;
                 *outY = abd.rc.top - targetH - marginTask;
                 break;
             }
             case ABE_TOP: {
-                // Taskbar is at top: abd.rc.bottom is the dynamic bottom edge
                 *outX = rcWork.right - targetW - marginSide;
                 *outY = abd.rc.bottom + marginTask;
                 break;
             }
             case ABE_LEFT: {
-                // Taskbar is at left: abd.rc.right is the dynamic right edge
                 *outX = abd.rc.right + marginTask;
                 *outY = rcWork.bottom - targetH - marginSide;
                 break;
             }
             case ABE_RIGHT: {
-                // Taskbar is at right: abd.rc.left is the dynamic left edge
                 *outX = abd.rc.left - targetW - marginTask;
                 *outY = rcWork.bottom - targetH - marginSide;
                 break;
@@ -281,7 +264,20 @@ static LRESULT CALLBACK AlertWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
         }
 
         case WM_PAINT: {
-            PAINTSTRUCT ps;HDC dc=BeginPaint(hWnd,&ps);RECT rc;GetClientRect(hWnd,&rc);DrawAlert(dc,GetCurrentWindowDpi(hWnd),s_modelName,s_battery,s_isCritical,s_btnHover,s_closeHover);EndPaint(hWnd,&ps);return 0;
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(hWnd, &ps);
+            RECT rc;
+            GetClientRect(hWnd, &rc);
+            HDC memDC = CreateCompatibleDC(dc);
+            HBITMAP memBmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+            HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
+            DrawAlert(memDC, GetCurrentWindowDpi(hWnd), s_modelName, s_battery, s_isCritical, s_btnHover, s_closeHover);
+            BitBlt(dc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
+            SelectObject(memDC, oldBmp);
+            DeleteObject(memBmp);
+            DeleteDC(memDC);
+            EndPaint(hWnd, &ps);
+            return 0;
         }
 
         case WM_DESTROY:
@@ -366,11 +362,6 @@ void Show(const WCHAR* modelName, int battery, bool isCritical, bool isWired) {
     // Calculate dynamic position hugging the taskbar
     int x = 0, y = 0;
     CalculateAlertPosition(targetW, targetH, dpi, &x, &y);
-
-    // NOTE: SetWindowRgn is removed!
-    // SetWindowRgn disables DWM anti-aliased corner rounding and drop shadow,
-    // causing 1-bit jagged staircase pixels (毛边).
-    // DWM with DWMWCP_ROUND automatically provides GPU subpixel antialiasing and drop shadow.
 
     SetWindowPos(g_hAlertWnd, HWND_TOPMOST, x, y, targetW, targetH, SWP_NOACTIVATE);
     InvalidateRect(g_hAlertWnd, NULL, TRUE);

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="1.0.0.0" processorArchitecture="*" name="RapooVT7Tray" type="win32"/>
-  <description>Rapoo VT7 V2 Lightweight Tray Utility</description>
+  <assemblyIdentity version="1.3.2.0" processorArchitecture="*" name="RapooAndLeobogTray" type="win32"/>
+  <description>Rapoo VT3S MAX Master V2 and LEOBOG HI98C Pro Dual Battery Tray Utility</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>

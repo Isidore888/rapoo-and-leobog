@@ -3,6 +3,7 @@
 #include "ui_theme.h"
 #include <strsafe.h>
 #include <algorithm>
+#include <tuple>
 
 namespace Osd {
 
@@ -15,8 +16,8 @@ static bool statusMode=false, statusDark=true,valueMode=false,valueKeyboard=fals
 static wchar_t valueLabel[64]{},valueText[32]{};
 static Device::State statusMouse;
 static Keyboard::State statusKeyboard;
+static int statusWarnings[2]={-1,-1};
 
-static const COLORREF OSD_KEY_COLOR = RGB(10, 12, 16);
 static const UINT_PTR TIMER_OSD_HIDE = 101;
 static const UINT_PTR TIMER_OSD_FADE = 102;
 
@@ -67,21 +68,11 @@ static LRESULT CALLBACK OsdWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
                 SelectObject(memDC,oldBmp);DeleteObject(memBmp);DeleteDC(memDC);EndPaint(hWnd,&ps);return 0;
             }
 
-            // Fill with Key Color for transparency
-            HBRUSH hKey = CreateSolidBrush(OSD_KEY_COLOR);
-            FillRect(memDC, &rc, hKey);
-            DeleteObject(hKey);
+            // Unified anti-aliased dark surface (eliminates 1-bit LWA_COLORKEY jagged corners)
+            Ui::Surface(memDC, rc, dpi);
 
             RECT rcBox = rc;
             InflateRect(&rcBox, -S(2), -S(2));
-
-            // Modern frosted card background & border
-            HBRUSH hBg = CreateSolidBrush(Ui::Background);
-            HPEN hBorder = CreatePen(PS_SOLID, 1, Ui::Border);
-            HGDIOBJ oldBr = SelectObject(memDC, hBg);
-            HGDIOBJ oldPen = SelectObject(memDC, hBorder);
-
-            RoundRect(memDC, rcBox.left, rcBox.top, rcBox.right, rcBox.bottom, S(16), S(16));
 
             SetBkMode(memDC, TRANSPARENT);
 
@@ -95,7 +86,7 @@ static LRESULT CALLBACK OsdWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
                 CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Microsoft YaHei UI"
             );
             HGDIOBJ oldFont = SelectObject(memDC, hFontBig);
-            SetTextColor(memDC, RGB(255, 255, 255));
+            SetTextColor(memDC, Ui::Text);
 
             RECT rcTop = rcBox;
             rcTop.top = rcBox.top + S(8);
@@ -136,8 +127,6 @@ static LRESULT CALLBACK OsdWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
             BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
 
             SelectObject(memDC, oldFont);
-            SelectObject(memDC, oldPen);
-            SelectObject(memDC, oldBr);
             SelectObject(memDC, oldBmp);
             DeleteObject(memBmp);
             DeleteDC(memDC);
@@ -145,8 +134,6 @@ static LRESULT CALLBACK OsdWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
             DeleteObject(hFontBig);
             DeleteObject(hFontMid);
             if (hFontSub) DeleteObject(hFontSub);
-            DeleteObject(hBorder);
-            DeleteObject(hBg);
 
             EndPaint(hWnd, &ps);
             return 0;
@@ -159,7 +146,7 @@ static LRESULT CALLBACK OsdWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
             } else if (wParam == TIMER_OSD_FADE) {
                 if (g_osdAlpha > 15) {
                     g_osdAlpha -= 15;
-                    SetLayeredWindowAttributes(hWnd, OSD_KEY_COLOR, g_osdAlpha, LWA_COLORKEY | LWA_ALPHA);
+                    SetLayeredWindowAttributes(hWnd, 0, g_osdAlpha, LWA_ALPHA);
                 } else {
                     KillTimer(hWnd, TIMER_OSD_FADE);
                     ShowWindow(hWnd, SW_HIDE);
@@ -192,6 +179,11 @@ bool Init(HINSTANCE hInstance) {
         NULL, NULL, hInstance, NULL
     );
 
+    if (g_hOsdWnd) {
+        BOOL isDark = TRUE;
+        DwmSetWindowAttribute(g_hOsdWnd, 20, &isDark, sizeof(isDark));
+    }
+
     return (g_hOsdWnd != NULL);
 }
 
@@ -209,7 +201,6 @@ HWND GetWindowHandle() {
 void Show(const WCHAR* line1, const WCHAR* line2, const WCHAR* line3, UINT durationMs) {
     if (!g_hOsdWnd) return;
     statusMode=false;valueMode=false;
-    SetWindowRgn(g_hOsdWnd,nullptr,TRUE);
     SetWindowTextW(g_hOsdWnd,L"RapooOSD");
 
     StringCchCopyW(g_textLine1, ARRAYSIZE(g_textLine1), line1 ? line1 : L"");
@@ -228,6 +219,8 @@ void Show(const WCHAR* line1, const WCHAR* line2, const WCHAR* line3, UINT durat
     GetMonitorInfoW(hMon, &mi);
     RECT rcWork = mi.rcWork;
 
+    // Move first so per-monitor DPI is read from the target monitor.
+    SetWindowPos(g_hOsdWnd, nullptr, rcWork.left, rcWork.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     UINT dpi = GetCurrentWindowDpi(g_hOsdWnd);
     auto S = [dpi](int v) { return ScaleDpi(v, dpi); };
 
@@ -287,10 +280,11 @@ void Show(const WCHAR* line1, const WCHAR* line2, const WCHAR* line3, UINT durat
     KillTimer(g_hOsdWnd, TIMER_OSD_HIDE);
     KillTimer(g_hOsdWnd, TIMER_OSD_FADE);
 
-    g_osdAlpha = 240;
-    SetLayeredWindowAttributes(g_hOsdWnd, OSD_KEY_COLOR, g_osdAlpha, LWA_COLORKEY | LWA_ALPHA);
+    g_osdAlpha = 255;
+    SetLayeredWindowAttributes(g_hOsdWnd, 0, g_osdAlpha, LWA_ALPHA);
 
     SetWindowPos(g_hOsdWnd, HWND_TOPMOST, x, y, targetW, targetH, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    Ui::ApplyRoundCorners(g_hOsdWnd, targetW, targetH, S(22));
     InvalidateRect(g_hOsdWnd, NULL, TRUE);
 
     SetTimer(g_hOsdWnd, TIMER_OSD_HIDE, durationMs, NULL);
@@ -308,7 +302,10 @@ void ShowValue(const wchar_t* label,const wchar_t* value,bool keyboard,UINT dura
     RECT old{};GetWindowRect(g_hOsdWnd,&old);int dpi=GetCurrentWindowDpi(g_hOsdWnd),w=Ui::Scale(360,dpi),h=Ui::Scale(80,dpi);
     MONITORINFO mi{sizeof(mi)};GetMonitorInfoW(MonitorFromWindow(g_hOsdWnd,MONITOR_DEFAULTTONEAREST),&mi);
     int x=std::clamp(int(old.left+(old.right-old.left-w)/2),int(mi.rcWork.left),std::max(int(mi.rcWork.left),int(mi.rcWork.right)-w));
-    SetWindowPos(g_hOsdWnd,nullptr,x,old.bottom-h,w,h,SWP_NOACTIVATE|SWP_NOZORDER);SetWindowRgn(g_hOsdWnd,CreateRoundRectRgn(0,0,w+1,h+1,Ui::Scale(22,dpi),Ui::Scale(22,dpi)),TRUE);InvalidateRect(g_hOsdWnd,nullptr,FALSE);
+    SetLayeredWindowAttributes(g_hOsdWnd,0,g_osdAlpha,LWA_ALPHA);
+    SetWindowPos(g_hOsdWnd,nullptr,x,old.bottom-h,w,h,SWP_NOACTIVATE|SWP_NOZORDER);
+    Ui::ApplyRoundCorners(g_hOsdWnd,w,h,Ui::Scale(22,dpi));
+    InvalidateRect(g_hOsdWnd,nullptr,FALSE);
 }
 void ShowDpiUpdate(int level,int dpix,int dpiy,int battery,int pollingHz,bool isCharging,bool isWired,const WCHAR* modelName) {
     (void)level;(void)dpiy;(void)battery;(void)pollingHz;(void)isCharging;(void)isWired;(void)modelName;
@@ -321,11 +318,8 @@ void DrawStatus(HDC dc,int dpi,bool dark,const Device::State& mouse,const Keyboa
         bool wired=k?keyboard.isWired:mouse.isWired,charging=valid && (k?keyboard.isCharging:mouse.isCharging);
         int percent=k?keyboard.battery:mouse.battery;valid=valid && percent>=0 && percent<=100;
         int cx=S(90+k*180),cy=S(79),radius=S(50);COLORREF color=charging?RGB(148,229,181):valid && percent<=Alert::GetConfig(k).warning?RGB(255,184,138):k?Ui::Keyboard:Ui::Accent;
-        HPEN p=CreatePen(PS_SOLID,S(5),Ui::Border);auto op=SelectObject(dc,p);auto ob=SelectObject(dc,GetStockObject(NULL_BRUSH));Ellipse(dc,cx-radius,cy-radius,cx+radius,cy+radius);
-        SelectObject(dc,op);DeleteObject(p);
-        if(valid && percent>0) {p=CreatePen(PS_SOLID,S(5),color);SelectObject(dc,p);POINT points[101];int count=std::max(1,percent);
-            for(int n=0;n<=count;++n){double angle=-1.5707963267948966+6.283185307179586*n/100;points[n]={cx+LONG(radius*std::cos(angle)),cy+LONG(radius*std::sin(angle))};}Polyline(dc,points,count+1);SelectObject(dc,op);DeleteObject(p);}
-        SelectObject(dc,ob);
+        // Anti-aliased SDF dual battery ring with smooth rounded arc caps
+        Ui::Ring(dc,cx,cy,radius,std::max(2,S(5)),valid,percent,Ui::Border,color);
         wchar_t value[32];if(valid)StringCchPrintfW(value,32,L"%d%%",percent);else StringCchCopyW(value,32,L"—");
         Ui::Label(dc,value,RECT{cx-S(48),cy-S(28),cx+S(48),cy+S(9)},25,dpi,valid?color:Ui::Muted,DT_CENTER,true);
         Ui::Label(dc,k?L"键盘":L"鼠标",RECT{cx-S(45),cy+S(9),cx+S(45),cy+S(35)},13,dpi,Ui::Muted,DT_CENTER);
@@ -349,6 +343,7 @@ void DrawStatus(HDC dc,int dpi,bool dark,const Device::State& mouse,const Keyboa
 void ShowStatus(const Device::State& mouse,const Keyboard::State& keyboard,POINT anchor,UINT durationMs) {
     if(!g_hOsdWnd)return;
     statusMode=true;valueMode=false;statusMouse=mouse;statusKeyboard=keyboard;
+    statusWarnings[0]=Alert::GetConfig(0).warning;statusWarnings[1]=Alert::GetConfig(1).warning;
     statusDark=true;
     MONITORINFO mi{sizeof(mi)};GetMonitorInfoW(MonitorFromPoint(anchor,MONITOR_DEFAULTTONEAREST),&mi);
     // Move first so per-monitor DPI is read from the target monitor.
@@ -359,12 +354,23 @@ void ShowStatus(const Device::State& mouse,const Keyboard::State& keyboard,POINT
     KillTimer(g_hOsdWnd,TIMER_OSD_HIDE);KillTimer(g_hOsdWnd,TIMER_OSD_FADE);
     g_osdAlpha=255;SetLayeredWindowAttributes(g_hOsdWnd,0,255,LWA_ALPHA);
     SetWindowPos(g_hOsdWnd,HWND_TOPMOST,x,y,w,h,SWP_SHOWWINDOW|SWP_NOACTIVATE);
-    HRGN region=CreateRoundRectRgn(0,0,w+1,h+1,MulDiv(14,dpi,96),MulDiv(14,dpi,96));SetWindowRgn(g_hOsdWnd,region,TRUE);
+    Ui::ApplyRoundCorners(g_hOsdWnd,w,h,MulDiv(14,dpi,96));
     SetWindowTextW(g_hOsdWnd,L"鼠标和键盘电量");InvalidateRect(g_hOsdWnd,nullptr,TRUE);
     if(durationMs)SetTimer(g_hOsdWnd,TIMER_OSD_HIDE,durationMs,nullptr);
 }
+static auto StatusValues(const Device::State& mouse,const Keyboard::State& keyboard) {
+    return std::make_tuple(mouse.isConnected,mouse.isWired,mouse.batteryValid,mouse.battery,mouse.isCharging,
+        mouse.dpiX,mouse.pollingHz,mouse.sleepMinutes,keyboard.isConnected,keyboard.isWired,
+        keyboard.batteryValid,keyboard.battery,keyboard.isCharging,keyboard.lightingValid,keyboard.lightingStale,
+        keyboard.brightness,keyboard.lightSpeed,keyboard.sleepValid,keyboard.sleepStale,keyboard.sleepSeconds);
+}
 void UpdateStatus(const Device::State& mouse,const Keyboard::State& keyboard) {
-    if(!IsStatusVisible())return;statusMouse=mouse;statusKeyboard=keyboard;InvalidateRect(g_hOsdWnd,nullptr,FALSE);
+    if(!IsStatusVisible())return;
+    int mouseWarning=Alert::GetConfig(0).warning,keyboardWarning=Alert::GetConfig(1).warning;
+    bool changed=StatusValues(statusMouse,statusKeyboard)!=StatusValues(mouse,keyboard) ||
+        statusWarnings[0]!=mouseWarning || statusWarnings[1]!=keyboardWarning;
+    statusMouse=mouse;statusKeyboard=keyboard;statusWarnings[0]=mouseWarning;statusWarnings[1]=keyboardWarning;
+    if(changed)InvalidateRect(g_hOsdWnd,nullptr,FALSE);
 }
 bool IsStatusVisible(){return statusMode && g_hOsdWnd && IsWindowVisible(g_hOsdWnd);}
 void HideStatus(){if(!statusMode)return;KillTimer(g_hOsdWnd,TIMER_OSD_HIDE);KillTimer(g_hOsdWnd,TIMER_OSD_FADE);ShowWindow(g_hOsdWnd,SW_HIDE);}

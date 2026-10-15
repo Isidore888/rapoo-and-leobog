@@ -122,19 +122,11 @@ static void ApplyModernWindowStyle(HWND hWnd, bool isDark, int w = 0, int h = 0)
     BOOL darkVal = isDark ? TRUE : FALSE;
     DwmSetWindowAttribute(hWnd, 20, &darkVal, sizeof(darkVal)); // DWMWA_USE_IMMERSIVE_DARK_MODE
 
-    // Request Windows 11 rounded corners (DWMWA_WINDOW_CORNER_PREFERENCE = 33)
-    DWORD corner = 2; // DWMWCP_ROUND
-    DwmSetWindowAttribute(hWnd, 33, &corner, sizeof(corner));
-
-    // Also clip window region with rounded corners for compatibility
     RECT rc = {0};
     GetWindowRect(hWnd, &rc);
     int width = (w > 0) ? w : (rc.right - rc.left);
     int height = (h > 0) ? h : (rc.bottom - rc.top);
-    if (width > 0 && height > 0) {
-        HRGN hRgn = CreateRoundRectRgn(0, 0, width + 1, height + 1, S(12), S(12));
-        SetWindowRgn(hWnd, hRgn, TRUE);
-    }
+    Ui::ApplyRoundCorners(hWnd, width, height, S(12), Ui::Border);
 
     if (fnSetWindowCompositionAttribute) {
         ACCENT_POLICY policy = {};
@@ -266,23 +258,13 @@ static void ApplySleepSlider() {
 }
 
 static void DrawSubMenuSurface(HDC memDC,const RECT& rc) {
-    COLORREF bgCol = Ui::Background;
     COLORREF borderCol = Ui::Border;
     COLORREF hoverCol = Ui::Control;
     COLORREF textCol = Ui::Text;
     COLORREF checkCol = Ui::Accent;
     COLORREF trackBgCol = g_curDark ? RGB(45, 50, 60) : RGB(215, 220, 230);
 
-    HBRUSH bgBrush = CreateSolidBrush(bgCol);
     Ui::Surface(memDC,rc,g_curDpi);
-    DeleteObject(bgBrush);
-
-    HPEN borderPen = CreatePen(PS_SOLID, 1, borderCol);
-    HGDIOBJ oldPen = SelectObject(memDC, borderPen);
-    HGDIOBJ oldBrush = SelectObject(memDC, GetStockObject(NULL_BRUSH));
-    RoundRect(memDC, 0, 0, rc.right, rc.bottom, S(22), S(22));
-    SelectObject(memDC, oldPen);
-    DeleteObject(borderPen);
 
     HFONT hFontNormal = CreateFontW(-S(13), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -307,17 +289,9 @@ static void DrawSubMenuSurface(HDC memDC,const RECT& rc) {
         int itemH = S(28);
         int y = S(8);
         for (int i = 0; i < count; i++) {
-            RECT rItem = { S(6), y, rc.right - S(6), y + itemH };
+            RECT rItem = { S(6), y + 1, rc.right - S(6), y + itemH - 1 };
             if (i == g_subHover) {
-                HBRUSH hH = CreateSolidBrush(hoverCol);
-                HPEN hP = CreatePen(PS_SOLID, 1, hoverCol);
-                HGDIOBJ oP = SelectObject(memDC, hP);
-                HGDIOBJ oB = SelectObject(memDC, hH);
-                RoundRect(memDC, rItem.left, rItem.top + 1, rItem.right, rItem.bottom - 1, S(6), S(6));
-                SelectObject(memDC, oP);
-                SelectObject(memDC, oB);
-                DeleteObject(hP);
-                DeleteObject(hH);
+                Ui::Box(memDC, rItem, hoverCol, hoverCol, S(6));
             }
 
             SetTextColor(memDC, textCol);
@@ -357,31 +331,12 @@ static void DrawSubMenuSurface(HDC memDC,const RECT& rc) {
         ratio = std::clamp(ratio, 0.0, 1.0);
         int thumbX = trackX0 + (int)(ratio * (trackX1 - trackX0));
 
-        // Draw background track (inactive portion)
-        HBRUSH hTrackBg = CreateSolidBrush(trackBgCol);
-        HGDIOBJ oP = SelectObject(memDC, GetStockObject(NULL_PEN));
-        HGDIOBJ oB = SelectObject(memDC, hTrackBg);
-        RoundRect(memDC, thumbX, trackY - trackH / 2, trackX1, trackY + trackH / 2 + 1, S(4), S(4));
-
-        // Draw filled track (active portion)
-        HBRUSH hTrackActive = CreateSolidBrush(checkCol);
-        SelectObject(memDC, hTrackActive);
-        RoundRect(memDC, trackX0, trackY - trackH / 2, thumbX, trackY + trackH / 2 + 1, S(4), S(4));
-
-        // Draw thumb
-        int thumbR = S(8);
-        HBRUSH hThumbBg = CreateSolidBrush(g_curDark ? RGB(255, 255, 255) : RGB(255, 255, 255));
-        HPEN hThumbBorder = CreatePen(PS_SOLID, 2, checkCol);
-        SelectObject(memDC, hThumbBorder);
-        SelectObject(memDC, hThumbBg);
-        Ellipse(memDC, thumbX - thumbR, trackY - thumbR, thumbX + thumbR, trackY + thumbR);
-
-        SelectObject(memDC,oP);
-        SelectObject(memDC,oB);
-        DeleteObject(hThumbBg);
-        DeleteObject(hThumbBorder);
-        DeleteObject(hTrackActive);
-        DeleteObject(hTrackBg);
+        // Draw anti-aliased track & thumb
+        Ui::Box(memDC, RECT{ trackX0, trackY - trackH / 2, trackX1, trackY + trackH / 2 + 1 }, trackBgCol, trackBgCol, S(4));
+        if (thumbX > trackX0) {
+            Ui::Box(memDC, RECT{ trackX0, trackY - trackH / 2, thumbX, trackY + trackH / 2 + 1 }, checkCol, checkCol, S(4));
+        }
+        Ui::Circle(memDC, thumbX, trackY, S(8), RGB(255, 255, 255), checkCol, std::max(2, S(2)));
 
         Ui::Label(memDC,g_activeSubId==5?L"1 分钟":L"2 分钟",RECT{S(20),S(70),S(94),S(91)},11,g_curDpi,Ui::Muted);
         Ui::Label(memDC,L"120 分钟",RECT{rc.right-S(105),S(70),rc.right-S(20),S(91)},11,g_curDpi,Ui::Muted,DT_RIGHT);
@@ -397,16 +352,9 @@ static void DrawSubMenuSurface(HDC memDC,const RECT& rc) {
         for (int i = 0; i < count; i++) {
             RECT rChip = { curX, chipY0, curX + chipW, chipY1 };
             bool isCur = (g_sliderVal == PRESET_SLEEP[i]);
-
-            HBRUSH hChipBg = CreateSolidBrush(isCur ? checkCol : (g_curDark ? RGB(36, 40, 50) : RGB(232, 236, 244)));
-            HPEN hChipPen = CreatePen(PS_SOLID, 1, isCur ? checkCol : borderCol);
-            SelectObject(memDC, hChipPen);
-            SelectObject(memDC, hChipBg);
-            RoundRect(memDC, rChip.left, rChip.top, rChip.right, rChip.bottom, S(6), S(6));
-            SelectObject(memDC,oP);
-            SelectObject(memDC,oB);
-            DeleteObject(hChipPen);
-            DeleteObject(hChipBg);
+            COLORREF chipBg = isCur ? checkCol : (g_curDark ? RGB(36, 40, 50) : RGB(232, 236, 244));
+            COLORREF chipBorder = isCur ? checkCol : borderCol;
+            Ui::Box(memDC, rChip, chipBg, chipBorder, S(6));
 
             SetTextColor(memDC, isCur ? (g_curDark ? RGB(10, 12, 16) : RGB(255, 255, 255)) : textCol);
             WCHAR szChip[16];
@@ -418,8 +366,6 @@ static void DrawSubMenuSurface(HDC memDC,const RECT& rc) {
     }
 
     SelectObject(memDC, oldFont);
-    SelectObject(memDC, oldPen);
-    SelectObject(memDC, oldBrush);
     DeleteObject(hFontNormal);
     DeleteObject(hFontBold);
     DeleteObject(hFontSmall);
@@ -923,7 +869,17 @@ static LRESULT CALLBACK AcrylicMainWndProc(HWND hWnd, UINT msg, WPARAM wParam, L
             RECT rc;
             GetClientRect(hWnd, &rc);
 
-            DrawMenuSurface(hdc,rc,g_curDpi,g_curDark,g_mainItems,g_mainHover);
+            // Offscreen double-buffering eliminates text/row flicker during hover updates
+            HDC memDC = CreateCompatibleDC(hdc);
+            HBITMAP hbm = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+            HBITMAP oldBm = (HBITMAP)SelectObject(memDC, hbm);
+
+            DrawMenuSurface(memDC, rc, g_curDpi, g_curDark, g_mainItems, g_mainHover);
+
+            BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
+            SelectObject(memDC, oldBm);
+            DeleteObject(hbm);
+            DeleteDC(memDC);
 
             EndPaint(hWnd, &ps);
             return 0;
@@ -947,13 +903,26 @@ void ShowMenu(HWND hWndOwner) {
     MONITORINFO mi = { sizeof(mi) };
     GetMonitorInfoW(hMon, &mi);
 
-    HMODULE hUser = GetModuleHandleW(L"user32.dll");
-    if (hUser) {
-        typedef UINT (WINAPI *pfnGetDpiForWindow)(HWND);
-        pfnGetDpiForWindow fnGetDpi = (pfnGetDpiForWindow)GetProcAddress(hUser, "GetDpiForWindow");
-        if (fnGetDpi && hWndOwner) g_curDpi = fnGetDpi(hWndOwner);
+    g_curDpi = 0;
+    HMODULE hShcore = LoadLibraryExW(L"shcore.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (hShcore) {
+        typedef HRESULT (WINAPI *pfnGetDpiForMonitor)(HMONITOR, int, UINT*, UINT*);
+        pfnGetDpiForMonitor fnGetDpiMon = (pfnGetDpiForMonitor)GetProcAddress(hShcore, "GetDpiForMonitor");
+        UINT dpiX = 0, dpiY = 0;
+        if (fnGetDpiMon && hMon && SUCCEEDED(fnGetDpiMon(hMon, 0, &dpiX, &dpiY)) && dpiX > 0) {
+            g_curDpi = (int)dpiX;
+        }
+        FreeLibrary(hShcore);
     }
-    if (g_curDpi == 0) g_curDpi = 96;
+    if (g_curDpi <= 0) {
+        HMODULE hUser = GetModuleHandleW(L"user32.dll");
+        if (hUser) {
+            typedef UINT (WINAPI *pfnGetDpiForWindow)(HWND);
+            pfnGetDpiForWindow fnGetDpi = (pfnGetDpiForWindow)GetProcAddress(hUser, "GetDpiForWindow");
+            if (fnGetDpi && hWndOwner) g_curDpi = fnGetDpi(hWndOwner);
+        }
+    }
+    if (g_curDpi <= 0) g_curDpi = 96;
 
     Device::State st = Device::GetCurrentState();
 
@@ -1005,14 +974,18 @@ void ShowMenu(HWND hWndOwner) {
     g_hMenuMouseHook = SetWindowsHookExW(WH_MOUSE_LL, MenuMouseHookProc, hInst, 0);
 
     g_bModalLoop = true;
-    MSG msg;
+    MSG msg{};
     while (g_bModalLoop && GetMessageW(&msg, NULL, 0, 0)) {
         if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
             DismissAllMenus();
             break;
         }
+        if (Alert::HandleSettingsMessage(&msg)) continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
+    }
+    if (g_bModalLoop) {
+        DismissAllMenus();
     }
     if (msg.message == WM_QUIT) {
         PostQuitMessage((int)msg.wParam);

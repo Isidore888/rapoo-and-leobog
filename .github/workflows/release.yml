@@ -24,6 +24,11 @@ jobs:
           update: false
           install: mingw-w64-x86_64-gcc mingw-w64-x86_64-binutils
 
+      - name: Run Unit & Offscreen Render Tests
+        shell: msys2 {0}
+        run: |
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/run_tests.ps1 -Render
+
       - name: Build rapoo-tray.exe (Standalone)
         shell: msys2 {0}
         run: |

@@ -123,6 +123,7 @@ public:
     }
     bool Attach() {
         Close();
+        Hid::ScopedVidFilter vidFilter(0x258A);
         for(const auto& ep:Hid::Enumerate()) {
             const auto& c=ep.caps;
             if(ep.vid!=0x258A || ep.pid!=0x010C || c.UsagePage!=0xFF00 || c.Usage!=1 || c.InputReportByteLength!=4)continue;

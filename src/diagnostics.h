@@ -5,18 +5,46 @@
 #include <cstdio>
 #include <cwchar>
 #include <string>
+#include <vector>
+#include <algorithm>
 
 namespace Diagnostics {
 inline std::mutex mutex;
 inline HANDLE file=INVALID_HANDLE_VALUE;
 inline DWORD bytes=0,limit=8*1024*1024;
+inline constexpr std::size_t maxSegments=16;
 inline unsigned long long sequence=0;
 inline std::wstring directory;
 inline unsigned long long nextPart=0;
 inline std::atomic<unsigned long long> ids{0},activeUsbQuery{0},activeUsbIo{0};
+inline std::atomic<DWORD> writeFailure{ERROR_SUCCESS};
+inline DWORD TakeWriteFailure(){return writeFailure.exchange(ERROR_SUCCESS);}
 inline thread_local unsigned long long query=0;
 inline thread_local BYTE command=0,parameter=0;
 struct PreserveError {DWORD saved=GetLastError();~PreserveError(){SetLastError(saved);}};
+inline void PruneOldSegmentsLocked() {
+    if(directory.empty() || !maxSegments)return;
+    struct Entry { FILETIME written{}; std::wstring name; };
+    std::vector<Entry> entries;
+    WIN32_FIND_DATAW data{};
+    HANDLE find=FindFirstFileW((directory+L"\\usb-*.jsonl").c_str(),&data);
+    if(find==INVALID_HANDLE_VALUE)return;
+    do {
+        if(!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            entries.push_back({data.ftLastWriteTime,data.cFileName});
+        }
+    } while(FindNextFileW(find,&data));
+    FindClose(find);
+    if(entries.size()<=maxSegments)return;
+    std::sort(entries.begin(),entries.end(),[](const Entry& a,const Entry& b) {
+        LONG cmp=CompareFileTime(&a.written,&b.written);
+        return cmp!=0?cmp<0:a.name<b.name;
+    });
+    const std::size_t removeCount=entries.size()-maxSegments;
+    for(std::size_t i=0;i<removeCount;++i) {
+        DeleteFileW((directory+L"\\"+entries[i].name).c_str());
+    }
+}
 // Caller holds mutex; CREATE_NEW cannot overwrite an earlier segment.
 inline bool OpenPartLocked() {
     SYSTEMTIME utc;GetSystemTime(&utc);
@@ -24,14 +52,17 @@ inline bool OpenPartLocked() {
         wchar_t name[120];std::swprintf(name,120,L"/usb-%04u%02u%02uT%02u%02u%02u-%lu-%llu.jsonl",
             utc.wYear,utc.wMonth,utc.wDay,utc.wHour,utc.wMinute,utc.wSecond,GetCurrentProcessId(),nextPart++);
         file=CreateFileW((directory+name).c_str(),GENERIC_WRITE,FILE_SHARE_READ,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
-        if(file!=INVALID_HANDLE_VALUE){bytes=0;return true;}
+        if(file!=INVALID_HANDLE_VALUE){bytes=0;PruneOldSegmentsLocked();return true;}
         if(GetLastError()!=ERROR_FILE_EXISTS)return false;
     }
     return false;
 }
 inline bool WriteLocked(const char* data,DWORD size) {
     DWORD done=0;
-    if(!WriteFile(file,data,size,&done,nullptr) || done!=size) {
+    BOOL ok=WriteFile(file,data,size,&done,nullptr);
+    if(!ok || done!=size) {
+        DWORD error=ok?ERROR_WRITE_FAULT:GetLastError();
+        writeFailure=error?error:ERROR_WRITE_FAULT;
         CloseHandle(file);file=INVALID_HANDLE_VALUE;return false;
     }
     bytes+=done;return true;
@@ -53,7 +84,7 @@ inline void Log(const char* event,unsigned long long op=0,unsigned cmd=0,unsigne
         const char end[]="{\"event\":\"log_segment_end\",\"continues\":true}\n";
         if(!WriteLocked(end,sizeof(end)-1))return;
         CloseHandle(file);file=INVALID_HANDLE_VALUE;
-        if(!OpenPartLocked())return;
+        if(!OpenPartLocked()){DWORD error=GetLastError();writeFailure=error?error:ERROR_WRITE_FAULT;return;}
         const char begin[]="{\"event\":\"log_segment_start\",\"continues\":true}\n";
         if(!WriteLocked(begin,sizeof(begin)-1))return;
     }
@@ -67,10 +98,12 @@ inline bool Init(const std::wstring& targetDirectory,DWORD maxBytes=8*1024*1024)
         if(!CreateDirectoryW(targetDirectory.c_str(),nullptr) && GetLastError()!=ERROR_ALREADY_EXISTS)return false;
         directory=targetDirectory;nextPart=0;limit=maxBytes;sequence=0;
         if(!OpenPartLocked())return false;
+        writeFailure=ERROR_SUCCESS;
     }
     Log("session_start");
     Log("usb_profile_original",0,0,0,1,0,3000);
-    return true;
+    std::lock_guard<std::mutex> lock(mutex);
+    return file!=INVALID_HANDLE_VALUE;
 }
 inline bool Init() {
     PreserveError preserve;

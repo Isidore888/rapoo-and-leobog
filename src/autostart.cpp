@@ -86,7 +86,7 @@ State Set(bool enabled) {
         auto command=Command(Executable());
         if(command.empty())return {Status::InvalidPath,ERROR_FILENAME_EXCED_RANGE,false};
         result=RegCreateKeyExW(HKEY_CURRENT_USER,RunKey,0,nullptr,0,KEY_SET_VALUE,nullptr,&key,nullptr);
-        if(result==ERROR_SUCCESS)result=RegSetValueExW(key,Name,0,REG_SZ,reinterpret_cast<const BYTE*>(command.c_str()),DWORD((command.size()+1)*sizeof(wchar_t)));
+        if(result==ERROR_SUCCESS)result=::RegSetValueExW(key,Name,0,REG_SZ,reinterpret_cast<const BYTE*>(command.c_str()),DWORD((command.size()+1)*sizeof(wchar_t)));
         if(key){RegCloseKey(key);key=nullptr;}
         if(result!=ERROR_SUCCESS)return Failure(result);
         auto registered=Read();
@@ -112,7 +112,7 @@ State Set(bool enabled) {
                 FILETIME disabledAt{};GetSystemTimeAsFileTime(&disabledAt);
                 CopyMemory(record.data()+4,&disabledAt,sizeof(disabledAt));
             }
-            if(result==ERROR_SUCCESS)result=RegSetValueExW(key,Name,0,REG_BINARY,record.data(),DWORD(record.size()));
+            if(result==ERROR_SUCCESS)result=::RegSetValueExW(key,Name,0,REG_BINARY,record.data(),DWORD(record.size()));
         }
     }
     if(key)RegCloseKey(key);

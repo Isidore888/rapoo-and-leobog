@@ -15,6 +15,8 @@ extern "C" {
 #include "device_notifications.h"
 #include "diagnostics.h"
 #include <memory>
+#include <tuple>
+#include <string>
 
 static const UINT WM_APP_TRAYMSG = WM_APP + 1;
 static const UINT WM_APP_STATE_UPDATE = WM_APP + 2;
@@ -28,6 +30,12 @@ static ULONGLONG keyboardFeedbackUntil = 0;
 static bool hoverPending=false, hoverVisible=false;
 static bool ignoreNextLeftUp=false;
 static bool suppressStyleHover=false;
+static bool diagnosticsWarningShown=false;
+static void UpdateHoverWatchTimer(HWND hWnd) {
+    if (!hWnd) return;
+    if (hoverVisible || suppressStyleHover) SetTimer(hWnd, 2, 100, nullptr);
+    else KillTimer(hWnd, 2);
+}
 static constexpr UINT SettingCompletedMessage=WM_APP+7;
 static SerialTasks mouseTasks,keyboardTasks;
 static ULONGLONG settingSequence=0,latestSetting[5]{};
@@ -61,6 +69,7 @@ static bool SubmitSetting(bool keyboard,int kind,int value) {
 static void ShowKeyboardFeedback(const wchar_t* title,const wchar_t* detail,const wchar_t* model) {
     KillTimer(g_hMainWnd,3);KillTimer(g_hMainWnd,4);
     hoverPending=hoverVisible=false;statusPopupUntil=0;
+    UpdateHoverWatchTimer(g_hMainWnd);
     keyboardFeedbackUntil=GetTickCount64()+2500;
     // Confirmed captions have a parameter/value separator; errors keep their reason.
     const wchar_t* separator=wcschr(title,L'：');if(!separator)separator=wcschr(title,L':');
@@ -80,8 +89,12 @@ static bool PointerAtTray() {
     return SUCCEEDED(Shell_NotifyIconGetRect(&id,&rect)) && PtInRect(&rect,point);
 }
 
-static void RefreshTrayUI(const Device::State& state) {
+static void RefreshTrayUI(const Device::State& state,bool force=false) {
     if (!g_hMainWnd) return;
+    if(!diagnosticsWarningShown && Diagnostics::TakeWriteFailure()) {
+        diagnosticsWarningShown=true;
+        MessageBoxW(g_hMainWnd,L"诊断日志已停止记录，请检查磁盘空间和日志目录写入权限。",L"诊断日志",MB_OK|MB_ICONWARNING);
+    }
 
     bool isDark = true;
     HKEY hKey;
@@ -98,16 +111,26 @@ static void RefreshTrayUI(const Device::State& state) {
 
     auto keyboard=Keyboard::GetCurrentState();
     Tray::UpdateMenuState(state,keyboard);
-    HICON hNewIcon = Tray::CreateBatteryIcon(state.battery, state.isCharging, state.isConnected && state.batteryValid, iconSize, isDark,keyboard.battery,keyboard.isCharging,keyboard.isConnected && keyboard.batteryValid);
-    if (hNewIcon) {
-        g_nid.hIcon = hNewIcon;
-        Tray::UpdateTooltip(g_nid, state,keyboard);
-        Shell_NotifyIconW(NIM_MODIFY, &g_nid);
-
-        if (g_hCurrentTrayIcon) {
-            DestroyIcon(g_hCurrentTrayIcon);
+    int style=Tray::GetBatteryStyle();
+    auto appearance=std::make_tuple(state.battery,state.isCharging,state.isConnected && state.batteryValid,
+        iconSize,isDark,keyboard.battery,keyboard.isCharging,keyboard.isConnected && keyboard.batteryValid,style,
+        Alert::GetConfig(0).warning,Alert::GetConfig(1).warning);
+    static auto lastAppearance=appearance;
+    static bool cached=false,notifyPending=false;
+    if(force || !cached || !g_hCurrentTrayIcon || appearance!=lastAppearance) {
+        HICON icon=Tray::CreateBatteryIcon(state.battery,state.isCharging,state.isConnected && state.batteryValid,
+            iconSize,isDark,keyboard.battery,keyboard.isCharging,keyboard.isConnected && keyboard.batteryValid,style);
+        if(icon) {
+            if(g_hCurrentTrayIcon)DestroyIcon(g_hCurrentTrayIcon);
+            g_hCurrentTrayIcon=g_nid.hIcon=icon;
+            lastAppearance=appearance;cached=true;notifyPending=true;
         }
-        g_hCurrentTrayIcon = hNewIcon;
+    }
+    std::wstring oldTooltip=g_nid.szTip;
+    Tray::UpdateTooltip(g_nid,state,keyboard);
+    notifyPending=notifyPending || oldTooltip!=g_nid.szTip;
+    if(force || notifyPending) {
+        if(Shell_NotifyIconW(NIM_MODIFY,&g_nid))notifyPending=false;
     }
 
     Alert::CheckBattery(state,keyboard);
@@ -122,7 +145,7 @@ static void OnDeviceStateChanged(const Device::State&, DWORD changeMask) {
 static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == g_uTaskbarRestartMsg) {
         Shell_NotifyIconW(NIM_ADD, &g_nid);
-        RefreshTrayUI(Device::GetCurrentState());
+        RefreshTrayUI(Device::GetCurrentState(),true);
         return 0;
     }
 
@@ -132,9 +155,11 @@ static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                 if(ignoreNextLeftUp){ignoreNextLeftUp=false;return 0;}
                 suppressStyleHover=false;
                 hoverVisible=false;hoverPending=false;KillTimer(hWnd,4);
+                UpdateHoverWatchTimer(hWnd);
                 SetTimer(hWnd,3,GetDoubleClickTime(),nullptr);
             } else if (lParam == WM_RBUTTONUP) {
                 KillTimer(hWnd,3);KillTimer(hWnd,4);hoverPending=hoverVisible=false;statusPopupUntil=0;Osd::HideStatus();
+                UpdateHoverWatchTimer(hWnd);
                 SetForegroundWindow(hWnd);
                 Tray::ShowMenu(hWnd);
             } else if (lParam == WM_LBUTTONDBLCLK) {
@@ -142,6 +167,7 @@ static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                 KillTimer(hWnd,3);KillTimer(hWnd,4);hoverPending=hoverVisible=false;statusPopupUntil=0;Osd::HideStatus();
                 Tray::CycleBatteryStyle();
                 suppressStyleHover=true;
+                UpdateHoverWatchTimer(hWnd);
                 RefreshTrayUI(Device::GetCurrentState());
             } else if(lParam==WM_MOUSEMOVE && !suppressStyleHover && !hoverPending && !hoverVisible && GetTickCount64()>=statusPopupUntil && GetTickCount64()>=keyboardFeedbackUntil) {
                 hoverPending=true;SetTimer(hWnd,4,500,nullptr);
@@ -162,6 +188,7 @@ static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             if(setting!=KeyboardProtocol::Setting::Brightness && setting!=KeyboardProtocol::Setting::Speed && setting!=KeyboardProtocol::Setting::Sleep)return 0;
             KillTimer(hWnd,3);KillTimer(hWnd,4);
             hoverPending=hoverVisible=false;statusPopupUntil=0;
+            UpdateHoverWatchTimer(hWnd);
             int kind=setting==KeyboardProtocol::Setting::Sleep?2:setting==KeyboardProtocol::Setting::Speed?1:0;
             if(!SubmitSetting(true,kind,static_cast<int>(lParam)))ShowKeyboardFeedback(L"键盘设置未发送",L"配置不可用或任务队列已关闭",nullptr);
             return 0;
@@ -228,15 +255,26 @@ static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                 ShowDeviceStatus();RefreshTrayUI(Device::GetCurrentState());
             } else if(wParam==4) {
                 KillTimer(hWnd,4);hoverPending=false;
-                if(GetTickCount64()>=keyboardFeedbackUntil && PointerAtTray()) {hoverVisible=true;ShowDeviceStatus();}
-            } else if(wParam==2 && suppressStyleHover && !PointerAtTray())suppressStyleHover=false;
-            else if(wParam==2 && hoverVisible && !PointerAtTray()) {
-                RECT rect{};POINT point{};GetCursorPos(&point);GetWindowRect(Osd::GetWindowHandle(),&rect);
-                if(!PtInRect(&rect,point)){hoverVisible=false;Osd::HideStatus();}
+                if(GetTickCount64()>=keyboardFeedbackUntil && PointerAtTray()) {
+                    hoverVisible=true;
+                    UpdateHoverWatchTimer(hWnd);
+                    ShowDeviceStatus();
+                }
+            } else if(wParam==2) {
+                if(suppressStyleHover && !PointerAtTray())suppressStyleHover=false;
+                if(hoverVisible && !PointerAtTray()) {
+                    RECT rect{};POINT point{};GetCursorPos(&point);GetWindowRect(Osd::GetWindowHandle(),&rect);
+                    if(!PtInRect(&rect,point)){hoverVisible=false;Osd::HideStatus();}
+                }
+                UpdateHoverWatchTimer(hWnd);
             }
             return 0;
         case WM_POWERBROADCAST:
-            if(wParam==PBT_APMRESUMEAUTOMATIC || wParam==PBT_APMRESUMESUSPEND){Device::NotifyDeviceChange();Keyboard::NotifyDeviceChange();}
+            if(wParam==PBT_APMRESUMEAUTOMATIC || wParam==PBT_APMRESUMESUSPEND) {
+                Device::NotifyDeviceChange();
+                Keyboard::NotifyDeviceChange();
+                RefreshTrayUI(Device::GetCurrentState());
+            }
             return TRUE;
         case WM_SETTINGCHANGE:
         case WM_THEMECHANGED: {
@@ -251,6 +289,18 @@ static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             if(targets & DeviceNotifications::Keyboard)Keyboard::NotifyDeviceChange();
             return 0;
         }
+
+        case WM_QUERYENDSESSION:
+            return TRUE;
+        case WM_ENDSESSION:
+            if (wParam) {
+                Diagnostics::Log("shutdown_endsession");
+                Device::BeginShutdown();Keyboard::BeginShutdown();
+                StopSettingTasks();
+                Shell_NotifyIconW(NIM_DELETE, &g_nid);
+                Diagnostics::Close();
+            }
+            return 0;
 
         case WM_CLOSE:
             Diagnostics::Log("shutdown_begin");
@@ -273,6 +323,7 @@ static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
+    (void)hPrevInstance;(void)pCmdLine;(void)nCmdShow;
     // Single instance protection
     HANDLE hMutex = CreateMutexW(NULL, TRUE, L"Local\\rapoo-traySingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -312,7 +363,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     // Initialize OSD and Alert Windows
     Osd::Init(hInstance);
     Alert::Init(hInstance);
-    if(!Diagnostics::Init())MessageBoxW(g_hMainWnd,L"诊断日志无法创建，请检查程序目录写入权限。",L"诊断日志",MB_OK|MB_ICONWARNING);
+    if(!Diagnostics::Init()) {
+        diagnosticsWarningShown=true;
+        Diagnostics::TakeWriteFailure();
+        MessageBoxW(g_hMainWnd,L"诊断日志无法创建或写入，请检查磁盘空间和目录写入权限。",L"诊断日志",MB_OK|MB_ICONWARNING);
+    }
 
     // Register PnP Device notifications
     DEV_BROADCAST_DEVICEINTERFACE_W dbFilter = {0};
@@ -339,7 +394,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         DestroyWindow(g_hMainWnd);
     }
     SetTimer(g_hMainWnd,1,10000,nullptr);
-    SetTimer(g_hMainWnd,2,100,nullptr);
 
     // Run message pump
     MSG msg;

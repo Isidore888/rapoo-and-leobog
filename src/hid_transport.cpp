@@ -1,13 +1,37 @@
 #include "hid_transport.h"
 #include "diagnostics.h"
 #include <setupapi.h>
+#include <cwchar>
 #ifndef IOCTL_HID_GET_FEATURE
 #include <hidclass.h>
 #endif
 namespace Hid {
+static bool PathMatchesFilter(const wchar_t* path, USHORT targetVid) {
+    if (!path) return false;
+    bool hasVidPrefix = false;
+    for (const wchar_t* p = path; *p; ++p) {
+        if (!_wcsnicmp(p, L"vid_", 4)) {
+            hasVidPrefix = true;
+            if (targetVid == 0x24AE) {
+                if (!_wcsnicmp(p + 4, L"24ae", 4)) return true;
+            } else if (targetVid == 0x258A || targetVid == 0x3554) {
+                if (!_wcsnicmp(p + 4, L"258a", 4) || !_wcsnicmp(p + 4, L"3554", 4)) return true;
+            } else {
+                if (!_wcsnicmp(p + 4, L"24ae", 4) || !_wcsnicmp(p + 4, L"258a", 4) || !_wcsnicmp(p + 4, L"3554", 4)) return true;
+            }
+        }
+    }
+    return !hasVidPrefix;
+}
+static bool VidMatchesFilter(USHORT vid, USHORT targetVid) {
+    if (targetVid == 0x24AE) return vid == 0x24AE;
+    if (targetVid == 0x258A || targetVid == 0x3554) return vid == 0x258A || vid == 0x3554;
+    return vid == 0x24AE || vid == 0x258A || vid == 0x3554;
+}
 std::vector<Endpoint> Enumerate() {
     const auto started=GetTickCount64();Diagnostics::Log("enumerate_begin");
     std::vector<Endpoint> result;
+    const USHORT targetVid = filterVid;
     GUID guid; HidD_GetHidGuid(&guid);
     HDEVINFO list = SetupDiGetClassDevsW(&guid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
     if (list == INVALID_HANDLE_VALUE) {Diagnostics::Log("enumerate_end",0,0,0,0,GetLastError(),0,GetTickCount64()-started);return result;}
@@ -19,11 +43,12 @@ std::vector<Endpoint> Enumerate() {
         auto detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W*>(buffer.data());
         detail->cbSize = sizeof(*detail);
         if (!SetupDiGetDeviceInterfaceDetailW(list, &info, detail, size, nullptr, nullptr)) continue;
+        if (!PathMatchesFilter(detail->DevicePath, targetVid)) continue;
         HANDLE h = CreateFileW(detail->DevicePath, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
         if (h == INVALID_HANDLE_VALUE) continue;
         HIDD_ATTRIBUTES attr{}; attr.Size = sizeof(attr);
         PHIDP_PREPARSED_DATA pp = nullptr;
-        if (HidD_GetAttributes(h, &attr) && (attr.VendorID == 0x24AE || attr.VendorID == 0x258A || attr.VendorID == 0x3554) && HidD_GetPreparsedData(h, &pp)) {
+        if (HidD_GetAttributes(h, &attr) && VidMatchesFilter(attr.VendorID, targetVid) && HidD_GetPreparsedData(h, &pp)) {
             Endpoint ep; ep.path = detail->DevicePath; ep.vid = attr.VendorID; ep.pid = attr.ProductID;
             if (HidP_GetCaps(pp, &ep.caps) == HIDP_STATUS_SUCCESS) result.push_back(ep);
             HidD_FreePreparsedData(pp);
@@ -36,7 +61,18 @@ std::vector<Endpoint> Enumerate() {
 }
 HANDLE Open(const Endpoint& ep, bool overlapped) {
     Diagnostics::Log("open_begin",0,0,0,overlapped,0,(unsigned(ep.vid)<<16)|ep.pid);
-    HANDLE h=CreateFileW(ep.path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, overlapped ? FILE_FLAG_OVERLAPPED : 0, nullptr);
+    // USB Feature endpoints (0x258A 520-byte feature report) only use IOCTL_HID_SET/GET_FEATURE.
+    // Opening with DesiredAccess=0 avoids registering an input report ring buffer in hidclass.sys.
+    const bool featureOnly = (ep.vid == 0x258A && ep.caps.FeatureReportByteLength == 520) ||
+        (ep.caps.InputReportByteLength == 0 && ep.caps.OutputReportByteLength == 0 && ep.caps.FeatureReportByteLength > 0);
+    const DWORD flags = overlapped ? FILE_FLAG_OVERLAPPED : 0;
+    HANDLE h = INVALID_HANDLE_VALUE;
+    if (featureOnly) {
+        h = CreateFileW(ep.path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, flags, nullptr);
+    }
+    if (h == INVALID_HANDLE_VALUE) {
+        h = CreateFileW(ep.path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, flags, nullptr);
+    }
     Diagnostics::Log("open_end",0,0,0,h!=INVALID_HANDLE_VALUE,h==INVALID_HANDLE_VALUE?GetLastError():0,(unsigned(ep.vid)<<16)|ep.pid);
     return h;
 }
